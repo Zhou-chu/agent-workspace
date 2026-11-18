@@ -1,6 +1,7 @@
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { openHosts } from './hosts.mjs';
+import { openArtifacts } from './artifacts.mjs';
 
 export function reject(status, message) {
   throw Object.assign(new Error(message), { status });
@@ -37,6 +38,10 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     CREATE TABLE IF NOT EXISTS task_dependencies (task_id TEXT NOT NULL REFERENCES tasks(id), dependency_id TEXT NOT NULL REFERENCES tasks(id),
       PRIMARY KEY(task_id,dependency_id), CHECK(task_id <> dependency_id));
     CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), author_id TEXT NOT NULL REFERENCES actors(id), task_ref TEXT REFERENCES tasks(id), question TEXT NOT NULL, options TEXT NOT NULL, status TEXT NOT NULL, response TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS decision_requests (
+      decision_id TEXT PRIMARY KEY REFERENCES decisions(id), author_id TEXT NOT NULL REFERENCES actors(id),
+      request_id TEXT, request_hash TEXT, message_ref TEXT REFERENCES messages(id), UNIQUE(author_id,request_id),
+      CHECK ((request_id IS NULL)=(request_hash IS NULL)));
     CREATE TABLE IF NOT EXISTS human_sessions (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
     INSERT OR IGNORE INTO rooms VALUES ('general','General');
   `);
@@ -68,10 +73,14 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
   const msgSelect = 'SELECT m.*,a.name author_name,a.kind author_kind FROM messages m JOIN actors a ON a.id=m.author_id';
   const getMessage = msgId => get(msgSelect + ' WHERE m.id=?', msgId);
   const task = r => ({id:r.id,roomId:r.room_id,title:r.title,description:r.description,assigneeId:r.assignee_id,status:r.status,createdAt:r.created_at,version:r.version,dependencyIds:all('SELECT dependency_id FROM task_dependencies WHERE task_id=? ORDER BY dependency_id',r.id).map(x=>x.dependency_id)});
-  const decision = r => ({id:r.id,roomId:r.room_id,taskRef:r.task_ref,question:r.question,options:JSON.parse(r.options),status:r.status,response:r.response,createdAt:r.created_at});
+  const decisionSelect = 'SELECT d.*,r.message_ref,COALESCE(a.owner_id,a.id) owner_id FROM decisions d JOIN actors a ON a.id=d.author_id LEFT JOIN decision_requests r ON r.decision_id=d.id';
+  const decision = r => ({id:r.id,roomId:r.room_id,authorId:r.author_id,ownerId:r.owner_id,taskRef:r.task_ref,
+    messageRef:r.message_ref,question:r.question,options:JSON.parse(r.options),status:r.status,response:r.response,createdAt:r.created_at});
+  const getDecision = decisionId => get(decisionSelect + ' WHERE d.id=?',decisionId);
 
   return {
     owner: getActor('owner'), hosts:openHosts(db,{clock,requireOwner,tx}), health: () => get('SELECT 1'), close: () => db.close(),
+    artifacts:openArtifacts(db,{requireMembership,tx,reject}),
     authenticateAgent(token) {
       return typeof token === 'string' && token.length <= 512 && token.startsWith('aw_agent_')
         ? actor(get("SELECT * FROM actors WHERE kind='agent' AND enabled=1 AND token_hash=?", digest(token))) ?? null : null;
@@ -259,34 +268,48 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       });
     },
     listDecisions(a) {
-      requireActor(a);
-      return all('SELECT d.* FROM decisions d JOIN members m ON m.room_id=d.room_id WHERE m.actor_id=? AND (? = ? OR d.author_id=?) ORDER BY d.created_at DESC,d.rowid DESC LIMIT 100',a.id,a.kind,'human',a.id).map(decision);
+      const me = requireActor(a);
+      return all(decisionSelect + ' JOIN members m ON m.room_id=d.room_id WHERE m.actor_id=? AND (a.owner_id=? OR d.author_id=?) ORDER BY d.created_at DESC,d.rowid DESC LIMIT 100',me.id,me.id,me.id).map(decision);
     },
     createDecision(a,input) {
       const roomId = str(input.roomId,'roomId',80), question = str(input.question,'question',2000), taskRef = optional(input.taskRef,'taskRef');
+      const requestId = optional(input.clientRequestId,'clientRequestId',100), messageRef = optional(input.messageRef,'messageRef');
+      if (requestId!==null && !/^[A-Za-z0-9_-]{1,100}$/.test(requestId)) reject(400,'Invalid clientRequestId');
       if (!Array.isArray(input.options) || input.options.length<2 || input.options.length>12) reject(400,'Provide 2 to 12 distinct options');
       const options = input.options.map(x=>str(x,'option',120).trim());
       if (new Set(options).size!==options.length) reject(400,'Options must be distinct');
+      const requestHash = requestId===null ? null : digest(JSON.stringify([roomId,taskRef,messageRef,question,options]));
       return tx(() => {
-        requireMembership(a,roomId);
-        if (taskRef && !get('SELECT 1 FROM tasks WHERE room_id=? AND id=? AND (? = ? OR assignee_id=?)', roomId, taskRef,a.kind,'human',a.id)) reject(400,'Task must be authorized in this room');
+        const me = requireActor(a);
+        requireMembership(me,roomId);
+        if (me.kind==='agent') requireMembership({id:me.ownerId},roomId);
+        if (taskRef && !get('SELECT 1 FROM tasks WHERE room_id=? AND id=? AND (? = ? OR assignee_id=?)',roomId,taskRef,me.kind,'human',me.id)) reject(400,'Task must be authorized in this room');
+        if (messageRef && !get('SELECT 1 FROM messages WHERE room_id=? AND id=?',roomId,messageRef)) reject(400,'Message must be in this room');
+        if (requestId!==null) {
+          const previous = get('SELECT decision_id,request_hash FROM decision_requests WHERE author_id=? AND request_id=?',me.id,requestId);
+          if (previous) {
+            if (previous.request_hash!==requestHash) reject(409,'Decision request ID is already used with different content');
+            return decision(getDecision(previous.decision_id));
+          }
+        }
         const decisionId = id();
-        run('INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)',decisionId,roomId,a.id,taskRef,question,JSON.stringify(options),'pending',null,now());
-        return decision(get('SELECT * FROM decisions WHERE id=?',decisionId));
+        run('INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)',decisionId,roomId,me.id,taskRef,question,JSON.stringify(options),'pending',null,now());
+        if (requestId!==null || messageRef!==null) run('INSERT INTO decision_requests VALUES (?,?,?,?,?)',decisionId,me.id,requestId,requestHash,messageRef);
+        return decision(getDecision(decisionId));
       });
     },
     resolveDecision(a,decisionId,input) {
       requireOwner(a);
       const response = str(input.response,'response',120);
       return tx(() => {
-        const row = get('SELECT * FROM decisions WHERE id=?',decisionId);
-        if (!row) reject(404,'Decision not found');
+        const row = getDecision(decisionId);
+        if (!row || row.owner_id!==a.id) reject(404,'Decision not found');
         requireMembership(a,row.room_id);
         if (row.response===response) return decision(row);
         if (row.status!=='pending') reject(409,'Decision is already resolved');
         if (!JSON.parse(row.options).includes(response)) reject(400,'Response must be one of the offered options');
         run("UPDATE decisions SET response=?,status='resolved' WHERE id=?",response,decisionId);
-        return decision(get('SELECT * FROM decisions WHERE id=?',decisionId));
+        return decision(getDecision(decisionId));
       });
     },
   };

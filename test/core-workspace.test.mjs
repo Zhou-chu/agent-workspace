@@ -89,6 +89,9 @@ test('file database preserves rooms, reminders, credentials and read positions a
   const room=store.createRoom(owner,{name:'Persistent room'});
   store.setRoomMember(owner,room.id,agent.id,true);
   const m=store.send(owner,room.id,{clientRequestId:'persist',body:'hello',mentions:[agent.id]});
+  const legacy=store.createDecision(owner,{roomId:room.id,question:'Legacy decision?',options:['yes','no']});
+  const ask={roomId:room.id,clientRequestId:'persist',messageRef:m.id,question:'New decision?',options:['first','second']};
+  const requested=store.createDecision(a,ask);
   store.listMessages(a,room.id,{consumer:'same'});
   store.close();
   store=openWorkspace(db);
@@ -96,6 +99,10 @@ test('file database preserves rooms, reminders, credentials and read positions a
   assert.deepEqual(store.listReminders(a).map(x=>x.message.id),[m.id]);
   assert.deepEqual(store.listMessages(a,room.id,{consumer:'same'}).messages,[]);
   assert.deepEqual(store.listMessages(a,room.id,{consumer:'different'}).messages.map(x=>x.id),[m.id]);
+  assert.deepEqual(store.createDecision(a,ask),requested);
+  assert.equal(requested.messageRef,m.id);
+  assert.deepEqual(store.listDecisions(owner),[requested,legacy]);
+  assert.equal(legacy.messageRef,null);
   store.close();
 });
 

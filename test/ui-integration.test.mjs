@@ -277,6 +277,36 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     assert.equal(h.named('button', '标记处理中').classList.contains('primary'), true);
     assert.equal(h.named('button', '标记受阻').classList.contains('primary'), false);
     assert.equal(h.named('button', '取消任务').classList.contains('task-cancel'), true);
+    await h.click('任务产物', 'summary');
+    await h.text('暂无产物。');
+    const artifactName=h.field('文件名', '回执.md');
+    h.field('文件类型', 'markdown');
+    h.field('产物正文', '# 实际回执\n<script>plain-text-only</script>');
+    const taskArtifacts = h.requests.length;
+    let loseFirstArtifact = true;
+    h.intercept(async (call, forward) => {
+      if (call.path.endsWith('/artifacts') && call.method==='POST' && loseFirstArtifact) {
+        loseFirstArtifact = false;
+        const response = await forward();
+        assert.equal(response.status,201);
+        await response.json();
+        throw new Error('产物响应丢失');
+      }
+      return forward();
+    });
+    h.submit(artifactName.form);
+    await h.text('产物响应丢失');
+    h.submit(artifactName.form);
+    const attachment=await h.find('a', '回执.md');
+    h.intercept(null);
+    assert.equal(attachment.getAttribute('download'),'');
+    assert.match(attachment.getAttribute('href'), /^\/api\/tasks\/[0-9a-f-]+\/artifacts\/[0-9a-f-]+$/);
+    const artifactPosts=h.requests.slice(taskArtifacts).filter(call=>call.method==='POST');
+    assert.equal(artifactPosts.length,2);
+    assert.equal(artifactPosts[0].body.clientRequestId,artifactPosts[1].body.clientRequestId);
+    assert.equal(h.d.querySelectorAll('a[download]').length,1);
+    assert.equal(h.d.body.textContent.includes('plain-text-only'),false);
+
     const [listed, current] = await h.asAnotherOwnerClient('GET', '/api/tasks');
     assert.equal(listed, 200);
     const task = current.tasks.find(item => item.title === 'Review follow-up');
