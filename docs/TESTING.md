@@ -1,5 +1,7 @@
 # Testing and hosted quality checks
 
+- `npm run check:architecture` checks the static JavaScript module graph once per CI run on Linux. `web/`, `server/`, `connector/` and `deploy/` may import only their own local modules; their integration uses the existing HTTP and process protocols. Browser modules cannot import Node built-ins, and production runtimes cannot import npm packages. Unresolved imports and cycles fail CI. There is no exception baseline. The gate does not analyze PowerShell/HTML or computed module specifiers. The `test/architecture-gate.test.mjs` fixtures prove the CLI accepts valid edges and exits nonzero on violations.
+
 - `node --test test/core-workspace.test.mjs test/api-workspace.test.mjs`: persistence, identity, room scope, alerts vs passive chat, idempotency, trusted decisions and lifecycle transitions.
 - `node --test test/mcp-chat.test.mjs test/api-task-artifacts.test.mjs test/ui-integration.test.mjs`: chat and explicit decision MCP semantics, task artifact authorization, immutable downloads, and lost-response retry. Local fixtures are not real model turns or remote artifact transfers.
 - `node --test test/connector-status.test.mjs`: host heartbeat and approved status-only action, recovery from a lost receipt, token revocation. No models or arbitrary execution.
