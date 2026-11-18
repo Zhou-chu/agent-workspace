@@ -479,7 +479,9 @@ function taskArtifacts(task, epoch) {
       if(live()&&attempt===generation) list.replaceChildren(el('p',{role:'alert'},error.message),button('重试加载产物',refresh));
     } finally { if(attempt===generation) loading=false; }
   }
-  const details=el('details',{ontoggle:()=>{ if(details.open&&!loaded&&!loading) refresh(); }},
+  const details=el('details',{ontoggle:event=>{
+    if(event.currentTarget.open&&!loaded&&!loading) void refresh();
+  }},
     el('summary',{},'任务产物'),list);
   const me=state.session.user;
   if(me.kind==='human'||(me.id===task.assigneeId&&!['accepted','cancelled'].includes(task.status))){

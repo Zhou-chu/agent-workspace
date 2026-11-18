@@ -277,8 +277,19 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     assert.equal(h.named('button', '标记处理中').classList.contains('primary'), true);
     assert.equal(h.named('button', '标记受阻').classList.contains('primary'), false);
     assert.equal(h.named('button', '取消任务').classList.contains('task-cancel'), true);
+    let failArtifactList=true;
+    h.intercept((call, forward) => {
+      if (call.path.endsWith('/artifacts') && call.method==='GET' && failArtifactList) {
+        failArtifactList=false;
+        throw new Error('暂时无法加载产物');
+      }
+      return forward();
+    });
     await h.click('任务产物', 'summary');
+    await h.text('暂时无法加载产物');
+    await h.click('重试加载产物');
     await h.text('暂无产物。');
+    h.intercept(null);
     const artifactName=h.field('文件名', '回执.md');
     h.field('文件类型', 'markdown');
     h.field('产物正文', '# 实际回执\n<script>plain-text-only</script>');
