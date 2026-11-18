@@ -30,7 +30,13 @@ export function deployedConfig(env = process.env) {
   if (!isAbsolute(root)) throw new Error("WORKSPACE_CD_ROOT must be absolute");
   const port = Number(env.WORKSPACE_PORT ?? "4319");
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Invalid application port");
-  return { repository, workflow, root, port, token, secureCookies: env.WORKSPACE_SECURE_COOKIE === "1" };
+  const publicOrigin = env.WORKSPACE_PUBLIC_ORIGIN || null;
+  if (publicOrigin) {
+    let parsed;
+    try { parsed = new URL(publicOrigin); } catch { /* reject below */ }
+    if (parsed?.protocol !== "https:" || parsed.origin !== publicOrigin) throw new Error("WORKSPACE_PUBLIC_ORIGIN must be an exact HTTPS origin");
+  }
+  return { repository, workflow, root, port, token, publicOrigin, secureCookies: Boolean(publicOrigin) || env.WORKSPACE_SECURE_COOKIES === "1" };
 }
 
 export function serviceEnv(config, dataDir, port, token) {
@@ -39,7 +45,8 @@ export function serviceEnv(config, dataDir, port, token) {
   return {
     ...os, NODE_ENV: "production", WORKSPACE_HOST: loopback, WORKSPACE_PORT: String(port),
     WORKSPACE_DATA_DIR: dataDir, WORKSPACE_TOKEN: token,
-    WORKSPACE_SECURE_COOKIE: config.secureCookies ? "1" : "0"
+    WORKSPACE_SECURE_COOKIES: config.secureCookies ? "1" : "0",
+    ...(config.publicOrigin ? { WORKSPACE_PUBLIC_ORIGIN: config.publicOrigin } : {})
   };
 }
 
@@ -218,7 +225,7 @@ export async function supervise(config, signal) {
     const smokeDir = await mkdtemp(join(tmpdir(), "agent-workspace-smoke-"));
     let trial;
     try {
-      trial = await launch(config, releasePath, smokeDir, await reserveLoopback(), randomBytes(32).toString("hex"));
+      trial = await launch({ ...config, publicOrigin: null, secureCookies: false }, releasePath, smokeDir, await reserveLoopback(), randomBytes(32).toString("hex"));
     } finally {
       await stopChild(trial);
       await rm(smokeDir, { recursive: true, force: true });

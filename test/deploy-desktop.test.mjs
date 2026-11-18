@@ -62,6 +62,20 @@ test("deployment requires a strong pre-provisioned token and fixed loopback serv
   assert.throws(() => deployedConfig({ ...good, WORKSPACE_PORT: "0" }), /port/i);
 });
 
+test("HTTPS settings use the server's plural secure-cookies contract", () => {
+  const good = { WORKSPACE_REPOSITORY: REPO, WORKSPACE_TOKEN: "x".repeat(48) };
+  const local = serviceEnv(deployedConfig(good), "data", 4319, "test");
+  assert.equal(local.WORKSPACE_SECURE_COOKIES, "0");
+  assert.equal(local.WORKSPACE_PUBLIC_ORIGIN, undefined);
+  const config = deployedConfig({ ...good, WORKSPACE_PUBLIC_ORIGIN: "https://workspace.example.test", WORKSPACE_SECURE_COOKIES: "1" });
+  const https = serviceEnv(config, "data", 4319, "test");
+  assert.equal(https.WORKSPACE_PUBLIC_ORIGIN, "https://workspace.example.test");
+  assert.equal(https.WORKSPACE_SECURE_COOKIES, "1");
+  assert.equal(https.WORKSPACE_HOST, "127.0.0.1");
+  assert.throws(() => deployedConfig({ ...good, WORKSPACE_PUBLIC_ORIGIN: "http://workspace.example.test" }), /HTTPS/);
+  assert.throws(() => deployedConfig({ ...good, WORKSPACE_PUBLIC_ORIGIN: "https://workspace.example.test/other" }), /HTTPS/);
+});
+
 function procedure({ broken = null } = {}) {
   const calls = [];
   const state = { active: { sha: OTHER, runId: 10 } };

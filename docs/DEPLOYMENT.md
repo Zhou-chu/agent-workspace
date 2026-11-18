@@ -22,7 +22,37 @@ its tailnet entry is already deployed.
   non-whitespace characters). Do not type it into a shell command, store
   it in a scheduled-task argument, or commit it to the repository.
 
-## Prepare and run
+## Install a reviewed Windows release
+
+From the reviewed checkout of `Zhou-chu/agent-workspace`, only after the
+exact `main` delivery CI succeeded, the signed-in owner can register the
+same-user limited logon task. This does not change firewall, Tailscale or
+PowerShell security settings. If execution policy or Task Scheduler refuses,
+stop rather than bypassing it. Do not run the installer as an administrator:
+
+```powershell
+powershell.exe -NoProfile -File .\deploy\windows-bootstrap.ps1 -Mode Install
+```
+
+The installer generates a random 256-bit application credential and stores
+only Windows DPAPI CurrentUser ciphertext in the same user's local profile.
+No token is passed as a command argument, written to task state, or printed.
+After `/healthz` succeeds, the actual Windows owner can run the installed
+script locally to open a masked dialog, then explicitly click **Reveal on
+this device** to use the key for `http://127.0.0.1:4319/`:
+
+```powershell
+& "$env:LOCALAPPDATA\AgentWorkspace\bootstrap\windows-bootstrap.ps1" -Mode ShowOwnerToken
+```
+
+Do not invoke reveal through remote agents, logs, screenshots, shared screens
+or recordings. Close the dialog after using the key. Clipboard history may
+keep copied secrets; avoid copying there when possible. The installer
+refuses to overwrite an existing task or credential. If installation fails
+partway, inspect the dedicated bootstrap folder and scheduled task before
+retrying so recovery does not rotate or erase a credential accidentally.
+
+## Run the supervisor manually
 
 Copy the reviewed supervisor from an explicitly selected release into a
 user-owned directory outside the runtime checkouts. Pin it to the actual
@@ -79,8 +109,11 @@ silently removing data.
   authorization, and a single local browser does not prove cross-device use.
 - Keep the listener on loopback. Tailnet delivery requires a separate approved
   private proxy/tailnet configuration with application authentication still
-  enforced. Use secure cookies (`WORKSPACE_SECURE_COOKIE=1`) when serving
-  exclusively via HTTPS. Do not enable a public Funnel, trust arbitrary
+  enforced. Use secure cookies when serving
+  exclusively via HTTPS, setting both `WORKSPACE_SECURE_COOKIES=1` and the
+  exact `WORKSPACE_PUBLIC_ORIGIN=https://…` in an approved manual setup.
+  The Windows installer above is loopback-only and does not configure an
+  origin or proxy. Do not enable a public Funnel, trust arbitrary
   proxy identity headers, or expose the process via an unrestricted bind or
   firewall rule.
 - On another actual device after private ingress is configured, verify
