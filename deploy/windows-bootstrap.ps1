@@ -1,19 +1,20 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Install', 'Run', 'ShowOwnerToken')]
+    [ValidateSet('Check', 'Install', 'Run', 'ShowOwnerToken')]
     [string] $Mode
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-    throw 'The Windows bootstrap requires Windows PowerShell on the deployment desktop.'
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $PSVersionTable.PSEdition -ne 'Desktop') {
+    throw 'Use Windows PowerShell 5.1 (powershell.exe) on the deployment desktop.'
 }
 $workspaceDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'AgentWorkspace'
 $bootstrapDir = Join-Path $workspaceDir 'bootstrap'
 $installedScript = Join-Path $bootstrapDir 'windows-bootstrap.ps1'
 $ownerTokenFile = Join-Path $bootstrapDir 'owner-token.dpapi'
+$runtimeFile = Join-Path $bootstrapDir 'runtime.json'
 $desktopSupervisor = Join-Path $bootstrapDir 'desktop.mjs'
 $taskName = 'AgentWorkspace-CD'
 $repo = 'Zhou-chu/agent-workspace'
@@ -49,15 +50,35 @@ function Convert-ToLocalToken([byte[]] $Bytes) {
     return [BitConverter]::ToString($Bytes).Replace('-', '').ToLowerInvariant()
 }
 
+function Find-Executable([string] $Name, [string] $Preferred) {
+    if ($Preferred -and (Test-Path -LiteralPath $Preferred -PathType Leaf)) {
+        return $Preferred
+    }
+    # Windows PowerShell can return multiple ApplicationInfo objects. Always select one.
+    $command = Get-Command -Name $Name -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (!$command) { throw ('Required executable unavailable: ' + $Name) }
+    return [string]$command.Source
+}
+
+function Read-InstallPrerequisites {
+    $node = Find-Executable 'node.exe' (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    $git = Find-Executable 'git.exe' (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')
+    $version = & $node --version
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v(\d+)\.\d+\.\d+' -or [int]$Matches[1] -lt 24) { throw 'Install official Node.js 24 or later first.' }
+    $major = [int]$Matches[1]
+    [void](Get-Command Register-ScheduledTask -ErrorAction Stop)
+    return [pscustomobject]@{ node = $node; git = $git; nodeMajor = [int]$major }
+}
+
 Assert-SafeDirectory $workspaceDir
 Assert-SafeDirectory $bootstrapDir
+if ($Mode -eq 'Check') {
+    $runtime = Read-InstallPrerequisites
+    [pscustomobject]@{ nodeMajor = $runtime.nodeMajor; preferredNode = ($runtime.node -ieq (Join-Path $env:ProgramFiles 'nodejs\node.exe')); preferredGit = ($runtime.git -ieq (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')); taskCmdletsAvailable = $true; persisted = 'none' } | ConvertTo-Json -Compress
+    return
+}
 if ($Mode -eq 'Install') {
-    $nodeExe = (Get-Command node.exe -CommandType Application).Source
-    $gitExe = (Get-Command git.exe -CommandType Application).Source
-    $nodeMajor = & $nodeExe -p 'process.versions.node.split(".")[0]'
-    if ($LASTEXITCODE -ne 0 -or [int]$nodeMajor -lt 24 -or !$gitExe) {
-        throw 'Install official Node.js 24 or later and Git first.'
-    }
+    $runtime = Read-InstallPrerequisites
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         throw 'The Agent Workspace task already exists; no changes made.'
     }
@@ -65,12 +86,15 @@ if ($Mode -eq 'Install') {
     if (!(Test-Path -LiteralPath $source -PathType Leaf)) {
         throw 'Use a reviewed checkout containing deploy/desktop.mjs.'
     }
-    foreach ($file in @($installedScript, $desktopSupervisor, $ownerTokenFile)) {
+    foreach ($file in @($installedScript, $desktopSupervisor, $ownerTokenFile, $runtimeFile)) {
         if (Test-Path -LiteralPath $file) { throw 'A bootstrap entry already exists; no changes made.' }
     }
     [void][IO.Directory]::CreateDirectory($bootstrapDir)
     [IO.File]::Copy($PSCommandPath, $installedScript, $false)
     [IO.File]::Copy($source, $desktopSupervisor, $false)
+    $manifest = [Text.Encoding]::UTF8.GetBytes(($runtime | ConvertTo-Json -Compress))
+    $runtimeHandle = [IO.File]::Open($runtimeFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $runtimeHandle.Write($manifest, 0, $manifest.Length) } finally { $runtimeHandle.Dispose() }
     Add-Type -AssemblyName System.Security
     $bytes = New-Object byte[] 32
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -100,7 +124,12 @@ if ($Mode -eq 'Run') {
     if (![string]::Equals([IO.Path]::GetFullPath($PSCommandPath), [IO.Path]::GetFullPath($installedScript), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Run mode requires the installed reviewed bootstrap.'
     }
-    $nodeExe = (Get-Command node.exe -CommandType Application).Source
+    $runtimeItem = Get-Item -LiteralPath $runtimeFile -Force
+    if ($runtimeItem.PSIsContainer -or ($runtimeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $runtimeItem.Length -gt 4096) { throw 'Pinned executable manifest is invalid.' }
+    $runtime = [IO.File]::ReadAllText($runtimeFile) | ConvertFrom-Json
+    foreach ($binary in @{ node = $runtime.node; git = $runtime.git }.GetEnumerator()) {
+        if (![IO.Path]::IsPathRooted($binary.Value) -or [IO.Path]::GetFileName($binary.Value) -ine ($binary.Key + '.exe') -or !(Test-Path -LiteralPath $binary.Value -PathType Leaf)) { throw 'A pinned executable is not available.' }
+    }
     $bytes = Read-LocalOwnerBytes
     try {
         $env:WORKSPACE_TOKEN = Convert-ToLocalToken $bytes
@@ -108,9 +137,10 @@ if ($Mode -eq 'Run') {
         $env:WORKSPACE_REPOSITORY = $repo
         $env:WORKSPACE_CI_WORKFLOW = 'ci.yml'
         $env:WORKSPACE_PORT = '4319'
+        $env:WORKSPACE_GIT_EXE = $runtime.git
         $env:WORKSPACE_SECURE_COOKIES = '0'
         $env:WORKSPACE_PUBLIC_ORIGIN = $null
-        & $nodeExe $desktopSupervisor
+        & $runtime.node $desktopSupervisor
         $code = $LASTEXITCODE
     } finally {
         $env:WORKSPACE_TOKEN = $null

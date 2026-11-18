@@ -31,11 +31,15 @@ PowerShell security settings. If execution policy or Task Scheduler refuses,
 stop rather than bypassing it. Do not run the installer as an administrator:
 
 ```powershell
+powershell.exe -NoProfile -File .\deploy\windows-bootstrap.ps1 -Mode Check
 powershell.exe -NoProfile -File .\deploy\windows-bootstrap.ps1 -Mode Install
 ```
 
 The installer generates a random 256-bit application credential and stores
 only Windows DPAPI CurrentUser ciphertext in the same user's local profile.
+It pins existing Node and Git executables by absolute path, preferring
+their standard Program Files installations. The check command runs before
+any installation and writes no app files or tasks.
 No token is passed as a command argument, written to task state, or printed.
 After `/healthz` succeeds, the actual Windows owner can run the installed
 script locally to open a masked dialog, then explicitly click **Reveal on
@@ -124,6 +128,7 @@ silently removing data.
 
 ```powershell
 node --test test/deploy-desktop.test.mjs
+powershell.exe -NoProfile -File .\test\deploy-bootstrap.test.ps1
 ```
 
 These deterministic tests validate trust selection, input validation,

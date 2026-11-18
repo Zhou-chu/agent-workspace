@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { exactMain, deployedConfig, serviceEnv, transition } from "../deploy/desktop.mjs";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { exactMain, deployedConfig, gitEnv, serviceEnv, transition } from "../deploy/desktop.mjs";
 
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
@@ -74,6 +75,16 @@ test("HTTPS settings use the server's plural secure-cookies contract", () => {
   assert.equal(https.WORKSPACE_HOST, "127.0.0.1");
   assert.throws(() => deployedConfig({ ...good, WORKSPACE_PUBLIC_ORIGIN: "http://workspace.example.test" }), /HTTPS/);
   assert.throws(() => deployedConfig({ ...good, WORKSPACE_PUBLIC_ORIGIN: "https://workspace.example.test/other" }), /HTTPS/);
+});
+
+test("pinned Git subprocess has a restricted PATH and never receives application credentials", () => {
+  const gitExe = resolve("reviewed", "Git", "git.exe");
+  const system = resolve("Windows");
+  const env = gitEnv(gitExe, { SystemRoot: system, PATH: "unexpected", WORKSPACE_TOKEN: "not for git", GH_TOKEN: "not for git", GIT_EXEC_PATH: "not for git" });
+  assert.deepEqual(env.PATH.split(delimiter), [dirname(gitExe), join(system, "System32"), system]);
+  for (const name of ["WORKSPACE_TOKEN", "GH_TOKEN", "GIT_EXEC_PATH"]) assert.equal(env[name], undefined);
+  assert.equal(env.GIT_TERMINAL_PROMPT, "0");
+  assert.throws(() => deployedConfig({ WORKSPACE_REPOSITORY: REPO, WORKSPACE_TOKEN: "x".repeat(48), WORKSPACE_GIT_EXE: "relative-git" }), /absolute/);
 });
 
 function procedure({ broken = null } = {}) {

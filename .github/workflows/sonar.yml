@@ -24,12 +24,20 @@ jobs:
         with:
           node-version: '24'
       - run: mkdir -p coverage && npm run coverage
-      - name: Check scan authorization
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: test -n "$SONAR_TOKEN" && test -s coverage/lcov.info
-      - uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602
+      - name: Require coverage report
+        run: test -s coverage/lcov.info
+      - name: Scan and enforce the Quality Gate
+        id: sonar_scan
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
-          args: -Dsonar.qualitygate.wait=true
+          args: >-
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.scanner.metadataFilePath=${{ runner.temp }}/agent-workspace-sonar-receipt.txt
+      - name: Summarize the exact Sonar Quality Gate
+        if: ${{ !cancelled() && (steps.sonar_scan.outcome == 'success' || steps.sonar_scan.outcome == 'failure') }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_RECEIPT: ${{ runner.temp }}/agent-workspace-sonar-receipt.txt
+        run: node scripts/sonar-gate.mjs

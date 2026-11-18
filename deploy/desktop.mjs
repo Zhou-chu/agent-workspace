@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
@@ -36,7 +36,9 @@ export function deployedConfig(env = process.env) {
     try { parsed = new URL(publicOrigin); } catch { /* reject below */ }
     if (parsed?.protocol !== "https:" || parsed.origin !== publicOrigin) throw new Error("WORKSPACE_PUBLIC_ORIGIN must be an exact HTTPS origin");
   }
-  return { repository, workflow, root, port, token, publicOrigin, secureCookies: Boolean(publicOrigin) || env.WORKSPACE_SECURE_COOKIES === "1" };
+  const gitExe = env.WORKSPACE_GIT_EXE || null;
+  if (gitExe && !isAbsolute(gitExe)) throw new Error("WORKSPACE_GIT_EXE must be absolute");
+  return { repository, workflow, root, port, token, gitExe, publicOrigin, secureCookies: Boolean(publicOrigin) || env.WORKSPACE_SECURE_COOKIES === "1" };
 }
 
 export function serviceEnv(config, dataDir, port, token) {
@@ -115,30 +117,36 @@ async function releaseState(path) {
   }
 }
 
-function gitEnv() {
-  return { ...serviceEnv({}, "", 4319, ""), WORKSPACE_TOKEN: "", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null" };
+export function gitEnv(gitExe, env = process.env) {
+  const inherited = Object.fromEntries(Object.entries(env).filter(([name]) => /^(?:systemroot|windir|temp|tmp|home|userprofile|localappdata|lang|lc_all)$/i.test(name)));
+  const windowsRoot = env.SystemRoot ?? env.SYSTEMROOT;
+  return {
+    ...inherited,
+    PATH: gitExe ? [dirname(gitExe), ...(windowsRoot ? [join(windowsRoot, "System32"), windowsRoot] : ["/usr/bin", "/bin"])].join(delimiter) : (env.PATH ?? env.Path ?? ""),
+    GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null"
+  };
 }
 
-const git = async (cwd, args) => (await execute("git", [
+const git = async (config, cwd, args) => (await execute(config.gitExe ?? "git", [
   "-c", "credential.helper=", "-c", "protocol.file.allow=never", ...args
-], { cwd, env: gitEnv(), windowsHide: true, timeout: 90_000, maxBuffer: 512 * 1024 })).stdout.trim();
+], { cwd, env: gitEnv(config.gitExe), windowsHide: true, timeout: 90_000, maxBuffer: 512 * 1024 })).stdout.trim();
 
 async function prepareRelease(config, release, releases) {
   validateRelease(release);
   const path = join(releases, release.sha);
   try {
-    if (await git(path, ["rev-parse", "HEAD"]) === release.sha &&
-        !(await git(path, ["status", "--porcelain", "--untracked-files=all"]))) return path;
+    if (await git(config, path, ["rev-parse", "HEAD"]) === release.sha &&
+        !(await git(config, path, ["status", "--porcelain", "--untracked-files=all"]))) return path;
     throw new Error("Existing release differs from verified commit; not overwriting");
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   const stage = await mkdtemp(join(releases, ".incoming-"));
   try {
-    await git(stage, ["init", "--quiet", "--template="]);
-    await git(stage, ["fetch", "--no-tags", "--depth=1", `https://github.com/${config.repository}.git`, release.sha]);
-    await git(stage, ["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
-    if (await git(stage, ["rev-parse", "HEAD"]) !== release.sha) throw new Error("Verified Git object and checkout differ");
+    await git(config, stage, ["init", "--quiet", "--template="]);
+    await git(config, stage, ["fetch", "--no-tags", "--depth=1", `https://github.com/${config.repository}.git`, release.sha]);
+    await git(config, stage, ["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+    if (await git(config, stage, ["rev-parse", "HEAD"]) !== release.sha) throw new Error("Verified Git object and checkout differ");
     await rename(stage, path);
     return path;
   } finally {
