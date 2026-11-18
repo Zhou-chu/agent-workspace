@@ -131,22 +131,22 @@ const git = async (config, cwd, args) => (await execute(config.gitExe ?? "git", 
   "-c", "credential.helper=", "-c", "protocol.file.allow=never", ...args
 ], { cwd, env: gitEnv(config.gitExe), windowsHide: true, timeout: 90_000, maxBuffer: 512 * 1024 })).stdout.trim();
 
-async function prepareRelease(config, release, releases) {
+async function prepareRelease(config, release, releases, runGit) {
   validateRelease(release);
   const path = join(releases, release.sha);
   try {
-    if (await git(config, path, ["rev-parse", "HEAD"]) === release.sha &&
-        !(await git(config, path, ["status", "--porcelain", "--untracked-files=all"]))) return path;
+    if (await runGit(config, path, ["rev-parse", "HEAD"]) === release.sha &&
+        !(await runGit(config, path, ["status", "--porcelain", "--untracked-files=all"]))) return path;
     throw new Error("Existing release differs from verified commit; not overwriting");
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   const stage = await mkdtemp(join(releases, ".incoming-"));
   try {
-    await git(config, stage, ["init", "--quiet", "--template="]);
-    await git(config, stage, ["fetch", "--no-tags", "--depth=1", `https://github.com/${config.repository}.git`, release.sha]);
-    await git(config, stage, ["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
-    if (await git(config, stage, ["rev-parse", "HEAD"]) !== release.sha) throw new Error("Verified Git object and checkout differ");
+    await runGit(config, stage, ["init", "--quiet", "--template="]);
+    await runGit(config, stage, ["fetch", "--no-tags", "--depth=1", `https://github.com/${config.repository}.git`, release.sha]);
+    await runGit(config, stage, ["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+    if (await runGit(config, stage, ["rev-parse", "HEAD"]) !== release.sha) throw new Error("Verified Git object and checkout differ");
     await rename(stage, path);
     return path;
   } finally {
@@ -213,7 +213,9 @@ async function launch(config, releasePath, dataDir, port, token) {
   }
 }
 
-export async function supervise(config, signal) {
+// Keep real process and file custody in this controller; allow local tests to
+// stand in for GitHub, Git command transport, and the four-minute poll wait.
+export async function supervise(config, signal, { fetcher = fetch, runGit = git, pause = delay, logger = console } = {}) {
   const { root } = config;
   await mkdir(root, { recursive: true, mode: 0o700 });
   const lock = join(root, "supervisor.lock");
@@ -226,10 +228,10 @@ export async function supervise(config, signal) {
   const statePath = join(root, "active.json");
   let child;
   let state;
-  const start = async release => { child = await launch(config, await prepareRelease(config, release, releases), data, config.port, config.token); };
+  const start = async release => { child = await launch(config, await prepareRelease(config, release, releases, runGit), data, config.port, config.token); };
   const stop = async () => { await stopChild(child); child = null; };
   const smoke = async release => {
-    const releasePath = await prepareRelease(config, release, releases);
+    const releasePath = await prepareRelease(config, release, releases, runGit);
     const smokeDir = await mkdtemp(join(tmpdir(), "agent-workspace-smoke-"));
     let trial;
     try {
@@ -256,19 +258,19 @@ export async function supervise(config, signal) {
     let attempted;
     while (!signal.aborted) {
       try {
-        const candidate = await exactMain(config);
+        const candidate = await exactMain(config, fetcher);
         const key = candidate ? `${candidate.sha}:${candidate.runId}` : null;
         if (candidate && state.active?.sha !== candidate.sha && key !== attempted) {
           attempted = key;
           state = await transition(state, candidate, { start, stop, smoke, backup, persist });
-          console.log(`Activated ${candidate.sha} from GitHub CI run ${candidate.runId}`);
+          logger.log(`Activated ${candidate.sha} from GitHub CI run ${candidate.runId}`);
         }
         if (state.active && (!child || childExited(child))) throw new Error("Active service exited; supervisor stopped for operator inspection");
       } catch (error) {
         if (state.active && (!child || childExited(child))) throw error;
-        console.error("No release switch. Check verified main CI, Git access, and local readiness.");
+        logger.error("No release switch. Check verified main CI, Git access, and local readiness.");
       }
-      await delay(240_000, null, { signal }).catch(error => { if (error.name !== "AbortError") throw error; });
+      await pause(240_000, null, { signal }).catch(error => { if (error.name !== "AbortError") throw error; });
     }
   } finally {
     await stop();

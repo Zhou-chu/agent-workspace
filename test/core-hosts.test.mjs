@@ -56,3 +56,26 @@ test('typed owner status request is idempotent, scoped and never replayed after 
   assert.equal(w.hosts.listChecks(w.owner,host.id).find(x=>x.id===pending.id).status,'cancelled');
   w.close();
 });
+
+test('host queue only accepts bounded reports; stale pending requests expire without a new claim',()=>{
+  let time=2_000_000;
+  const w=openWorkspace(':memory:','Owner',{clock:()=>time});
+  const {host,token}=w.hosts.register(w.owner,{name:'Queue'});
+  try {
+    const identity=w.hosts.authenticate(token);
+    assert.throws(()=>w.hosts.heartbeat(identity,{hostId:'not-declared'}),{status:400});
+    assert.throws(()=>w.hosts.claim(identity,{requestId:'not-online'}),{status:409});
+    w.hosts.heartbeat(identity,{});
+    const requested=Array.from({length:8},(_,i)=>w.hosts.requestCheck(w.owner,host.id,{clientRequestId:'q'+i}));
+    assert.throws(()=>w.hosts.requestCheck(w.owner,host.id,{clientRequestId:'overflow'}),{status:409});
+    const first=w.hosts.claim(identity,{requestId:'first'});
+    assert.equal(first.id,requested[0].id);
+    assert.throws(()=>w.hosts.ack(identity,first.id,{receiptId:'incorrect',result:{platform:'linux',connectorVersion:'0.1.0'}}),{status:404});
+    assert.throws(()=>w.hosts.ack(identity,first.id,{receiptId:first.receiptId,result:{platform:'unsupported',connectorVersion:'0.1.0'}}),{status:400});
+    time+=601_000;
+    assert.deepEqual(w.hosts.listChecks(w.owner,host.id).map(x=>x.status),[...Array(7).fill('expired'),'uncertain']);
+    w.hosts.heartbeat(identity,{});
+    assert.equal(w.hosts.claim(identity,{requestId:'after'}),null);
+    assert.equal(w.hosts.requestCheck(w.owner,host.id,{clientRequestId:'q1'}).status,'expired');
+  } finally {w.close();}
+});

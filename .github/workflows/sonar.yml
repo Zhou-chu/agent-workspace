@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
+      - run: npm ci --ignore-scripts
       - run: mkdir -p coverage && npm run coverage
       - name: Require coverage report
         run: test -s coverage/lcov.info
