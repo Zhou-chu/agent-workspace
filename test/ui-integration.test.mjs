@@ -71,7 +71,7 @@ async function harness(t) {
     observer.observe(d.documentElement, { subtree: true, attributes: true, childList: true, characterData: true });
     check();
   });
-  const named = (selector, label) => [...d.querySelectorAll(selector)].find(node => node.textContent.trim() === label);
+  const named = (selector, label) => [...d.querySelectorAll(selector)].find(node => node.getAttribute('aria-label') === label || node.textContent.trim() === label);
   const find = (selector, label) => wait(() => named(selector, label), label);
   const element = selector => wait(() => d.querySelector(selector), selector);
   const click = async (label, selector = 'button') => (await find(selector, label)).click();
@@ -112,7 +112,7 @@ async function harness(t) {
 }
 
 async function createAgent(h) {
-  await h.click('◇Agent 与设备');
+  await h.click('Agent 与设备');
   await h.click('添加 Agent', 'summary');
   h.submit(h.field('显示名称', 'Alpha').form);
   const key = (await h.element('.secret')).textContent;
@@ -133,10 +133,20 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     await h.find('.badge', '已停用身份');
     await h.click('启用');
     await h.find('.badge', '已启用身份');
-    await h.click('□群聊');
-    await h.click('新建群聊', 'summary');
+    await h.click('群聊');
+    await h.click('新建群聊');
     h.submit(h.field('群聊名称', 'Side room').form);
     await h.find('h1', 'Side room');
+    assert.equal(h.d.querySelector('.rail-chat').getAttribute('aria-current'), 'page');
+    assert.equal(h.d.querySelector('.rail-chat svg').getAttribute('aria-hidden'), 'true');
+    const edit = h.field('消息正文', 'unsent side-room draft');
+    edit.dispatchEvent(new h.dom.window.Event('input'));
+    h.named('button', '设置').focus();
+    await h.click('设置');
+    assert.equal(h.d.activeElement, h.named('button', '设置'));
+    await h.click('群聊');
+    await h.find('h1', 'Side room');
+    assert.equal(h.d.querySelector('.composer textarea').value, 'unsent side-room draft');
     await h.click('成员');
     await h.click('加入群聊');
     await h.find('button', '移出群聊');
@@ -177,6 +187,16 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
   await h.find('.message .body', 'plain reply');
   await h.click('返回群聊');
   await h.find('h1', 'Side room');
+  const mentionToggle = h.named('button', '@ 选择成员');
+  mentionToggle.focus();
+  await h.click('@ 选择成员');
+  await h.find('#mention-picker button', '@Alpha');
+  const mentionPanel = h.d.querySelector('#mention-picker');
+  assert.equal(mentionPanel.contains(h.d.activeElement), true);
+  h.d.activeElement.dispatchEvent(new h.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(mentionToggle.getAttribute('aria-expanded'), 'false');
+  assert.equal(mentionPanel.hidden, true);
+  assert.equal(h.d.activeElement, mentionToggle);
   await h.click('@ 选择成员');
   await h.click('@Alpha');
   await h.click('@Alpha ×');
@@ -191,7 +211,7 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
   });
   h.intercept(null);
   await t.test('decision, versioned task lifecycle and local settings remain usable', async () => {
-    await h.click('✓待处理');
+    await h.click('待处理');
     await h.click('新建决定事项', 'summary');
     h.field('问题', 'Choose a review outcome');
     h.submit(h.field('可选答案', 'A').form);
@@ -199,18 +219,21 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     h.submit(h.field('可选答案', 'A\nB').form);
     await h.click('B');
     await h.text('已选：B');
-    await h.click('≡项目任务');
+    await h.click('项目任务');
     await h.click('新建任务', 'summary');
     h.field('目标', 'Document the completed review.');
     h.submit(h.field('标题', 'Review follow-up').form);
     await h.find('h2', 'Review follow-up');
+    assert.equal(h.named('button', '标记处理中').classList.contains('primary'), true);
+    assert.equal(h.named('button', '标记受阻').classList.contains('primary'), false);
+    assert.equal(h.named('button', '取消任务').classList.contains('task-cancel'), true);
     await h.click('标记处理中');
     await h.find('.badge', '处理中');
     await h.click('请求验收');
     await h.find('.badge', '待验收');
     await h.click('验收通过');
     await h.find('.badge', '已验收');
-    await h.click('⊙设置');
+    await h.click('设置');
     const select = h.field('本设备主题', 'dark');
     select.dispatchEvent(new h.dom.window.Event('change'));
     assert.equal(h.d.documentElement.dataset.theme, 'dark');
@@ -222,7 +245,7 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
   await t.test('host dashboard only queues manual status for online devices and verifies revocation', async () => {
     await h.login();
     await h.element('.composer');
-    await h.click('◇Agent 与设备');
+    await h.click('Agent 与设备');
     await h.click('设备');
     await h.click('登记新设备', 'summary');
     h.submit(h.field('设备名称', 'Synthetic runner').form);
@@ -265,12 +288,12 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
   await t.test('failed reads display a retry path and expired sessions return to login', async () => {
     h.intercept((call, work) => call.path === '/api/tasks'
       ? new Response(JSON.stringify({ error: 'test service error' }), { status: 503 }) : work());
-    await h.click('≡项目任务');
+    await h.click('项目任务');
     await h.text('test service error');
     h.intercept(null);
     await h.click('重试');
     await h.find('h2', 'Review follow-up');
-    await h.click('□群聊');
+    await h.click('群聊');
     await h.find('.message .body', 'explicit mention');
     h.intercept((call, work) => call.method === 'GET' && call.path.includes('/messages?')
       ? new Response(JSON.stringify({ error: 'test connection unavailable' }), { status: 503 }) : work());

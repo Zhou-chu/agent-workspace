@@ -1,5 +1,6 @@
 import { chooseRoom, createChatPayload, mergeMessages } from './chat-model.mjs';
 import { hostStatus, checkStatus, mayRequestCheck, nextCheckRequestId } from './host-model.mjs';
+import { icon } from './icons.mjs';
 
 const root = document.querySelector('main');
 const state = {
@@ -7,16 +8,19 @@ const state = {
   cursor: null, items: [], hasMore: false, epoch: 0, pending: false,
 };
 const navigation = [
-  ['chat', '群聊', '□'], ['tasks', '项目任务', '≡'], ['agents', 'Agent 与设备', '◇'],
-  ['settings', '设置', '⊙'], ['decisions', '待处理', '✓'],
+  ['chat', '群聊'], ['tasks', '项目任务'], ['agents', 'Agent 与设备'],
+  ['decisions', '待处理'], ['settings', '设置'],
 ];
 const timestamp = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const messageTime = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' });
+const messageDay = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
 const storage = {
   get(key) { try { return localStorage.getItem(key); } catch { return null; } },
   set(key, value) { try { localStorage.setItem(key, value); } catch { /* UI remains usable */ } },
 };
 const themes = ['system', 'light', 'dark'];
 const feedPositions = new Map();
+const drafts = new Map();
 let theme = storage.get('workspace.theme');
 if (!themes.includes(theme)) theme = 'system';
 document.documentElement.dataset.theme = theme;
@@ -36,6 +40,12 @@ function el(tag, attrs = {}, ...children) {
 function button(label, action, attrs = {}) {
   return el('button', { type: 'button', ...attrs, onclick: action }, label);
 }
+function iconButton(label, glyph, action, attrs = {}, withText = false) {
+  const control = button('', action, { ...attrs, 'aria-label': label, title: label });
+  control.replaceChildren(icon(glyph), ...(withText ? [el('span', {}, label)] : []));
+  return control;
+}
+function brandMark() { return el('div', { class: 'brand', 'aria-hidden': 'true' }, icon('home')); }
 function notice(role = 'status') { return el('div', { class: 'notice', role }); }
 function field(label, input) { return el('label', {}, label, input); }
 function requestId() {
@@ -69,6 +79,8 @@ function mountLogin(text = '') {
   state.roomId = null;
   state.thread = null;
   feedPositions.clear();
+  drafts.clear();
+  state.mobile = false;
   const info = notice('alert');
   info.textContent = text;
   const input = el('input', { id: 'login-token', type: 'password', autocomplete: 'current-password', required: '', spellcheck: 'false' });
@@ -83,8 +95,9 @@ function mountLogin(text = '') {
       await bootstrap();
     } catch (error) { info.textContent = error.message; }
     finally { submit.disabled = false; }
-  } }, el('div', { class: 'brand', 'aria-hidden': 'true' }, 'W'), el('h1', {}, 'Agent Workspace'), field('访问密钥', input), submit, info);
+  } }, el('div', { class: 'login-heading' }, brandMark(), el('h1', {}, 'Agent Workspace')), field('访问密钥', input), submit, info);
   root.replaceChildren(el('section', { class: 'login', 'aria-label': '登录' }, form));
+  if (text) input.focus();
 }
 async function bootstrap() {
   try {
@@ -97,15 +110,29 @@ async function bootstrap() {
   }
 }
 let panel;
+let shell;
+const navControls = new Map();
 function frame(page) {
-  const nav = el('nav', { class: 'nav', 'aria-label': '工作台导航' }, el('div', { class: 'brand', 'aria-hidden': 'true' }, 'W'));
-  for (const [id, label, icon] of navigation) {
-    const item = button('', () => changePage(id), { class: id === 'decisions' ? 'decisions-link' : '', 'aria-current': id === page ? 'page' : null });
-    item.replaceChildren(el('span', { class: 'icon', 'aria-hidden': 'true' }, icon), el('span', {}, label));
-    nav.append(item);
+  if (!shell?.isConnected) {
+    navControls.clear();
+    panel = el('section', { class: 'view' });
+    const nav = el('nav', { class: 'nav', 'aria-label': '工作台导航' }, brandMark());
+    for (const [id, label] of navigation) {
+      const control = iconButton(label, id, () => changePage(id), { class: 'rail-button rail-' + id }, true);
+      navControls.set(id, control);
+      nav.append(control);
+    }
+    shell = el('div', { class: 'shell' }, nav, panel);
+    root.replaceChildren(shell);
   }
-  panel = el('section', { class: 'view', 'aria-label': navigation.find(row => row[0] === page)[1] });
-  root.replaceChildren(el('div', { class: 'shell' }, nav, panel));
+  for (const [id, item] of navControls) {
+    if (id === page) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  }
+  panel.setAttribute('aria-label', navigation.find(row => row[0] === page)[1]);
+  panel.dataset.page = page;
+  panel.scrollTop = 0;
+  panel.replaceChildren(el('div', { class: 'view-loading', role: 'status' }, '正在载入…'));
   return panel;
 }
 async function changePage(page) {
@@ -126,7 +153,9 @@ async function changePage(page) {
   }
 }
 function pageFrame(container, title, ...actions) {
-  const body = el('div', { class: 'page' }, el('header', { class: 'page-head' }, el('h1', {}, title), ...actions));
+  const body = el('div', { class: 'page' }, el('header', { class: 'page-head' },
+    el('div', { class: 'page-title' }, el('span', { class: 'overline' }, 'Agent Workspace'), el('h1', {}, title)),
+    actions.length ? el('div', { class: 'row' }, ...actions) : null));
   container.replaceChildren(body);
   return body;
 }
@@ -141,7 +170,14 @@ async function chatPage(target, epoch) {
   if (epoch !== state.epoch) return;
   state.rooms = loaded.rooms;
   state.roomId = chooseRoom(state.rooms, state.roomId ?? storage.get('workspace.room'));
-  const rooms = el('aside', { class: 'room-list', 'aria-label': '群聊列表' });
+  const roomRows = el('div', { class: 'room-rows' });
+  const roomHead = el('div', { class: 'room-section-head' });
+  const roomCreate = el('div', { class: 'room-create' });
+  const rooms = el('aside', { class: 'room-list', 'aria-label': '群聊列表' },
+    el('div', { class: 'workspace-masthead' }, el('span', { class: 'overline' }, '工作台'), el('h2', {}, 'Agent Workspace')),
+    el('section', { class: 'room-index' }, roomHead, roomCreate, roomRows),
+    el('div', { class: 'workspace-account' }, el('div', { class: 'workspace-account-mark', 'aria-hidden': 'true' },
+      Array.from(state.session.user.name)[0] ?? '·'), el('span', {}, state.session.user.name)));
   const chat = el('div', { class: 'chat' }, rooms);
   target.replaceChildren(chat);
   function roomList() {
@@ -159,14 +195,26 @@ async function chatPage(target, epoch) {
       } catch (error) { info.textContent = error.message; }
       finally { submit.disabled = false; }
     } }, field('群聊名称', name), submit, info);
-    rooms.replaceChildren(el('h2', {}, '群聊'), state.session.user.kind === 'human' ? expandable('新建群聊', add) : null, ...state.rooms.map(room => button(`# ${room.name}`, () => {
-      state.roomId = room.id;
-      state.thread = null;
-      state.mobile = true;
-      storage.set('workspace.room', room.id);
-      openRoom();
-    }, { class: 'room', 'aria-current': room.id === state.roomId ? 'true' : null })));
-    if (!state.rooms.length) rooms.append(el('p', { class: 'empty' }, '此账户没有可访问的群聊。'));
+    const createToggle = iconButton('新建群聊', 'plus', () => {
+      roomCreate.hidden = !roomCreate.hidden;
+      createToggle.setAttribute('aria-expanded', String(!roomCreate.hidden));
+      if (!roomCreate.hidden) name.focus();
+    }, { class: 'icon-button', 'aria-expanded': 'false' });
+    roomHead.replaceChildren(el('h2', {}, '群聊'), state.session.user.kind === 'human' ? createToggle : null);
+    roomCreate.hidden = true;
+    roomCreate.replaceChildren(add);
+    roomRows.replaceChildren(...state.rooms.map(room => {
+      const control = iconButton(room.name, 'hash', () => {
+        state.roomId = room.id;
+        state.thread = null;
+        state.mobile = true;
+        storage.set('workspace.room', room.id);
+        openRoom();
+        chat.querySelector('h1')?.focus();
+      }, { class: 'room', 'aria-current': room.id === state.roomId ? 'true' : null }, true);
+      return control;
+    }));
+    if (!state.rooms.length) roomRows.append(el('p', { class: 'empty' }, '此账户没有可访问的群聊。'));
   }
   function openRoom() {
     const marker = ++state.epoch;
@@ -176,7 +224,8 @@ async function chatPage(target, epoch) {
     const path = roomPath + '/messages';
     const viewKey = roomPath + '/' + (thread?.id ?? '');
     let restoreScroll = true;
-    const draft = { mentions: new Set(), replyTo: thread?.id ?? null, retry: null };
+    const draft = drafts.get(viewKey) ?? { body: '', mentions: new Set(), replyTo: thread?.id ?? null, retry: null };
+    drafts.set(viewKey, draft);
     state.items = [];
     state.cursor = null;
     state.hasMore = false;
@@ -192,27 +241,43 @@ async function chatPage(target, epoch) {
         else feedPositions.set(viewKey, feed.scrollTop);
       }
     } });
-    const input = el('textarea', { 'aria-label': '消息正文', placeholder: '写一条消息…', maxlength: '10000', required: '' });
+    const input = el('textarea', { 'aria-label': '消息正文', placeholder: '写一条消息…', maxlength: '10000', required: '', rows: '2',
+      oninput: () => { draft.body = input.value; },
+      onkeydown: event => {
+        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.isComposing && !submit.disabled) {
+          event.preventDefault(); input.form.requestSubmit();
+        }
+      } });
+    input.value = draft.body;
     const selected = el('div', { class: 'mention-chips', 'aria-label': '将提醒的成员' });
     const reply = el('div', { class: 'row' });
     const choices = el('div', { id: 'mention-picker', class: 'mention-panel', hidden: '' });
-    const toggle = button('@ 选择成员', () => {
-      choices.hidden = !choices.hidden;
-      toggle.setAttribute('aria-expanded', String(!choices.hidden));
-      if (!choices.hidden) choices.querySelector('button')?.focus();
-    }, { 'aria-controls': 'mention-picker', 'aria-expanded': 'false' });
-    const submit = el('button', { type: 'submit', class: 'primary' }, '发送');
+    function setMentionPicker(open, restoreFocus = false) {
+      choices.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+      if (open) choices.querySelector('button')?.focus();
+      else if (restoreFocus) toggle.focus();
+    }
+    const toggle = iconButton('@ 选择成员', 'at', () => setMentionPicker(choices.hidden, true),
+      { class: 'composer-mention', 'aria-controls': 'mention-picker', 'aria-expanded': 'false' });
+    const submit = el('button', { type: 'submit', class: 'primary send-button', title: '发送（Ctrl / ⌘ + Enter）' }, el('span', {}, '发送'), icon('send'));
     let members = [];
     const agentsById = new Map([state.session.user, ...(state.session.agents ?? [])].map(item => [item.id, item]));
     const selectedActorName = id => agentsById.get(id)?.name ?? id;
     function paintMentions() {
+      const previousMemberFocus = choices.contains(document.activeElement) ? document.activeElement.dataset.member : null;
+      const shouldRestoreMember = !choices.hidden && (previousMemberFocus || document.activeElement === toggle);
       selected.replaceChildren(...[...draft.mentions].map(id => button(`@${selectedActorName(id)} ×`, () => { draft.mentions.delete(id); paintMentions(); toggle.focus(); }, { class: 'chip', 'aria-label': `移除对 ${selectedActorName(id)} 的提醒` })));
       choices.replaceChildren(...members.map(actor => button(`@${actor.name}`, event => {
         if (draft.mentions.has(actor.id)) draft.mentions.delete(actor.id); else draft.mentions.add(actor.id);
         event.currentTarget.setAttribute('aria-pressed', String(draft.mentions.has(actor.id)));
         selected.replaceChildren(...[...draft.mentions].map(id => button(`@${selectedActorName(id)} ×`, () => { draft.mentions.delete(id); paintMentions(); toggle.focus(); }, { class: 'chip' })));
-      }, { 'aria-pressed': String(draft.mentions.has(actor.id)) })));
+      }, { 'aria-pressed': String(draft.mentions.has(actor.id)), 'data-member': actor.id })));
       if (!members.length) choices.append(el('span', { class: 'muted' }, '暂无可提及的成员'));
+      if (shouldRestoreMember) {
+        const controls = [...choices.querySelectorAll('button')];
+        (controls.find(control => control.dataset.member === previousMemberFocus) ?? controls[0])?.focus();
+      }
     }
     function paintReply() {
       if (!draft.replyTo) return reply.replaceChildren();
@@ -224,30 +289,52 @@ async function chatPage(target, epoch) {
       }, { class: 'subtle' }));
     }
     function messageNode(message) {
-      const time = humanTime(message.createdAt);
+      const date = new Date(message.createdAt);
+      const time = message.createdAt && Number.isFinite(+date) ? messageTime.format(date) : '';
       const author = message.authorName ?? message.author?.name ?? '成员';
       const top = el('header', {}, el('strong', {}, author),
         (message.authorKind ?? message.author?.kind) === 'agent' ? el('span', { class: 'badge' }, 'Agent') : null,
         time ? el('time', { datetime: new Date(message.createdAt).toISOString() }, time) : null);
-      const content = el('div', {}, top);
+      const content = el('div', { class: 'message-content' }, top);
       if (message.replyTo) content.append(el('div', { class: 'muted' }, '回复消息'));
       if (message.mentions?.length) content.append(el('div', { class: 'statuses' }, ...message.mentions.map(id => el('span', { class: 'badge' }, '@' + selectedActorName(id)))));
       content.append(el('p', { class: 'body' }, message.body));
-      const actions = el('div', { class: 'row' }, button('回复', () => {
+      const actions = el('div', { class: 'row message-actions' }, iconButton('回复', 'reply', () => {
         draft.replyTo = message.replyTo ?? message.id;
         paintReply();
         input.focus();
-      }, { class: 'subtle reply' }));
-      if (!thread && !message.replyTo) actions.append(button('查看线程', () => { state.thread = message; openRoom(); }, { class: 'subtle reply' }));
+      }, { class: 'subtle reply' }, true));
+      if (!thread && !message.replyTo) actions.append(iconButton('查看线程', 'thread', () => {
+        state.thread = message; openRoom(); chat.querySelector('h1')?.focus();
+      }, { class: 'subtle reply' }, true));
       content.append(actions);
-      return el('li', { class: 'message' }, el('div', { class: 'avatar', 'aria-hidden': 'true' }, Array.from(author.trim())[0] ?? '·'), content);
+      return el('li', { class: 'message', 'data-message': message.id }, el('div', { class: 'avatar', 'aria-hidden': 'true' }, Array.from(author.trim())[0] ?? '·'), content);
     }
     function paintFeed() {
       const closeToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 130;
       const before = feed.scrollTop;
-      feed.replaceChildren(...state.items.map(messageNode));
-      if (!state.items.length) feed.append(el('li', { class: 'empty' }, '暂无消息。已有工作可以从一条消息开始。'));
-      if (state.hasMore) feed.append(el('li', {}, button('加载更多消息', () => refresh(true))));
+      const activeControl = feed.contains(document.activeElement) ? document.activeElement : null;
+      const focusedMessage = activeControl?.closest('[data-message]')?.dataset.message;
+      const focusedAction = activeControl?.getAttribute('aria-label');
+      const items = document.createDocumentFragment();
+      let previousDay;
+      for (const message of state.items) {
+        const date = new Date(message.createdAt);
+        const day = message.createdAt && Number.isFinite(+date) ? messageDay.format(date) : null;
+        if (day && day !== previousDay) items.append(el('li', { class: 'day-divider' }, el('span', {}, day)));
+        previousDay = day;
+        items.append(messageNode(message));
+      }
+      feed.replaceChildren(items);
+      if (!state.items.length) feed.append(el('li', { class: 'chat-empty' },
+        el('div', { class: 'empty-icon', 'aria-hidden': 'true' }, icon(thread ? 'thread' : 'hash')),
+        el('h2', {}, thread ? '还没有回复' : '这里还没有消息'),
+        el('p', {}, thread ? '写一条回复，继续当前讨论。' : '写一条消息开始协作。需要对方接手时，再选中 @ 成员。')));
+      if (state.hasMore) feed.append(el('li', { class: 'load-more' }, button('加载更多消息', () => refresh(true))));
+      if (focusedMessage && focusedAction) {
+        const replacement = [...feed.querySelectorAll('[data-message]')].find(node => node.dataset.message === focusedMessage);
+        [...(replacement?.querySelectorAll('button') ?? [])].find(node => node.getAttribute('aria-label') === focusedAction)?.focus({ preventScroll: true });
+      }
       if (restoreScroll) {
         feed.scrollTop = feedPositions.get(viewKey) ?? feed.scrollHeight;
         restoreScroll = false;
@@ -277,7 +364,13 @@ async function chatPage(target, epoch) {
         info.textContent = `消息未刷新：${error.message}`;
       } finally { if (marker === state.epoch) state.pending = false; }
     }
-    const form = el('form', { class: 'composer', onsubmit: async event => {
+    const form = el('form', { class: 'composer', onkeydown: event => {
+      if (!choices.hidden && event.key === 'Escape' && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        setMentionPicker(false, true);
+      }
+    }, onsubmit: async event => {
       event.preventDefault();
       let payload;
       try { payload = createChatPayload({ body: input.value, mentions: draft.mentions, replyTo: draft.replyTo }, requestId()); }
@@ -290,11 +383,11 @@ async function chatPage(target, epoch) {
         await post(path, payload);
         if (marker !== state.epoch) return;
         input.value = '';
+        draft.body = '';
         draft.mentions.clear();
         draft.replyTo = thread?.id ?? null;
         draft.retry = null;
-        choices.hidden = true;
-        toggle.setAttribute('aria-expanded', 'false');
+        setMentionPicker(false);
         paintMentions(); paintReply();
         info.textContent = '';
         await refresh(true);
@@ -304,8 +397,9 @@ async function chatPage(target, epoch) {
           info.textContent = `未确认发送：${error.message}。保持内容不变重试不会重复创建消息。`;
         }
       } finally { submit.disabled = false; }
-    } }, reply, selected, choices, input, el('div', { class: 'composer-actions' }, toggle, submit));
-    const heading = el('h1', {}, thread ? '线程' : room.name);
+    } }, el('div', { class: 'composer-context' }, reply, selected, choices),
+      el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, toggle, submit)));
+    const heading = el('h1', { tabindex: '-1' }, thread ? '线程' : room.name);
     const memberPanel = el('div', { class: 'member-panel', hidden: '' });
     async function refreshMembers() {
       try {
@@ -334,15 +428,24 @@ async function chatPage(target, epoch) {
         if (marker === state.epoch) memberPanel.replaceChildren(el('p', { role: 'alert' }, error.message), button('重试成员列表', () => refreshMembers()));
       }
     }
-    const memberButton = button('成员', () => {
+    const memberButton = iconButton('成员', 'people', () => {
       memberPanel.hidden = !memberPanel.hidden;
       memberButton.setAttribute('aria-expanded', String(!memberPanel.hidden));
       if (!memberPanel.hidden) refreshMembers();
-    }, { class: 'subtle', 'aria-expanded': 'false' });
-    const back = button('群聊', () => { state.mobile = false; chat.dataset.mobile = 'rooms'; rooms.querySelector('[aria-current]')?.focus(); }, { class: 'mobile-back subtle' });
-    const threadBack = thread ? button('返回群聊', () => { state.thread = null; openRoom(); }, { class: 'subtle' }) : null;
-    const bar = el('header', {}, heading, el('div', { class: 'header-actions' }, back, threadBack, memberButton, button('刷新', () => refresh(true), { class: 'subtle' })));
-    chat.append(el('article', { class: 'conversation' }, bar, el('div', {}, info, memberPanel), feed, form));
+    }, { class: 'icon-button', 'aria-expanded': 'false' });
+    const back = iconButton('返回群聊列表', 'arrow', () => { state.mobile = false; chat.dataset.mobile = 'rooms'; rooms.querySelector('[aria-current]')?.focus(); }, { class: 'mobile-back icon-button' });
+    const threadBack = thread ? iconButton('返回群聊', 'arrow', () => {
+      state.thread = null; openRoom(); chat.querySelector('h1')?.focus();
+    }, { class: 'icon-button' }) : null;
+    const headingBox = el('div', { class: 'conversation-title' },
+      thread ? el('span', { class: 'overline' }, room.name) : null,
+      el('div', { class: 'conversation-heading' }, icon(thread ? 'thread' : 'hash'), heading));
+    const bar = el('header', { class: 'conversation-bar' },
+      el('div', { class: 'conversation-bar-inner' }, back, threadBack, headingBox,
+        el('div', { class: 'header-actions' }, memberButton, iconButton('刷新', 'refresh', () => refresh(true), { class: 'icon-button' }))));
+    const conversation = el('article', { class: 'conversation' }, bar,
+      el('div', { class: 'conversation-context' }, info, memberPanel), feed, el('div', { class: 'composer-dock' }, form));
+    chat.append(conversation);
     paintMentions(); paintReply();
     refresh(true);
     refreshMembers();
@@ -387,7 +490,7 @@ async function tasksPage(target, epoch) {
   const labels = { in_progress: '标记处理中', blocked: '标记受阻', cancelled: '取消任务', review_requested: '请求验收', accepted: '验收通过' };
   page.append(listRows(tasks, task => {
     const feedback = notice('alert');
-    const actions = el('div', { class: 'row' });
+    const actions = el('div', { class: 'row task-actions' });
     const options = Number.isInteger(task.version) ? transitions[task.status] ?? [] : [];
     if (state.session.user.kind === 'human') for (const status of options) actions.append(button(labels[status], async () => {
       for (const control of actions.children) control.disabled = true;
@@ -397,7 +500,7 @@ async function tasksPage(target, epoch) {
       } catch (error) {
         feedback.textContent = error.status === 409 ? '状态已更新，请刷新任务后重试。' : error.message;
       } finally { for (const control of actions.children) control.disabled = false; }
-    }));
+    }, { class: status === 'cancelled' ? 'task-cancel' : status === options[0] ? 'primary' : 'task-secondary' }));
     return el('div', { class: 'stack' },
       el('div', { class: 'row' }, el('h2', {}, task.title), el('span', { class: 'badge' }, stateLabel(task.status))),
       task.description ? el('p', { class: 'body' }, task.description) : null,
