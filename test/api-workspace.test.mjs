@@ -1,0 +1,80 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createWorkspaceServer } from '../server/index.mjs';
+import { openWorkspace } from '../server/workspace.mjs';
+
+test('browser cookie session, origin boundary and targeted agent authorization', async t => {
+  const store = openWorkspace(':memory:');
+  const ownerToken = 'a-strong-test-token-necessarily-32-chars';
+  const server = createWorkspaceServer({ store, ownerToken });
+  server.listen(0,'127.0.0.1');
+  await once(server,'listening');
+  t.after(async () => {
+    await new Promise(resolve=>server.close(resolve));
+    store.close();
+  });
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const request = (path, options) => fetch(origin + path, options);
+  const post = (path, payload, headers = {}) => request(path,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(payload)});
+  assert.equal((await request('/healthz')).status,200);
+  assert.equal((await request('/api/session')).status,401);
+  assert.equal((await post('/api/login',{token:ownerToken},{origin:'https://example.org'})).status,403);
+  const login = await post('/api/login',{token:ownerToken},{origin});
+  assert.equal(login.status,200);
+  const set = login.headers.get('Set-Cookie');
+  assert.match(set,/HttpOnly/i);
+  assert.match(set,/SameSite=Strict/i);
+  assert.ok(!set.includes(ownerToken));
+  const cookie = set.split(';')[0];
+  assert.equal((await request('/api/session',{headers:{cookie,Authorization:'invalid'}})).status,401);
+  const created = await post('/api/agents',{name:'Alpha'},{cookie,origin});
+  assert.equal(created.status,201);
+  const {agent,token} = await created.json();
+  const rooms = await request('/api/rooms',{headers:{Authorization:'Bearer '+token}});
+  assert.deepEqual(await rooms.json(),{rooms:[{id:'general',name:'General'}]});
+  const sent = await post('/api/rooms/general/messages',{clientRequestId:'once',body:'hi',mentions:[agent.id]},{cookie,origin});
+  const {message} = await sent.json();
+  assert.equal(message.authorId,'owner');
+  const reminders = await request('/api/reminders',{headers:{Authorization:'Bearer '+token}});
+  assert.deepEqual((await reminders.json()).reminders.map(x=>x.message.id),[message.id]);
+  const logout = await post('/api/logout',{}, {cookie,origin});
+  assert.equal(logout.status,200);
+  assert.equal((await request('/api/session',{headers:{cookie}})).status,401);
+});
+
+test('host HTTP routes enforce separate credentials and accept only the approved status diagnostic', async t=>{
+  const store = openWorkspace(':memory:');
+  const ownerToken='test-with-high-entropy-format-long-enough';
+  const server=createWorkspaceServer({store,ownerToken});
+  server.listen(0,'127.0.0.1');
+  await once(server,'listening');
+  t.after(async()=>{await new Promise(r=>server.close(r));store.close();});
+  const root='http://127.0.0.1:'+server.address().port;
+  const send=(url,method,token,payload)=>{
+    const headers={Authorization:'Bearer '+token};
+    const init={method,headers};
+    if(payload!==undefined){headers['Content-Type']='application/json';init.body=JSON.stringify(payload);}
+    return fetch(root+url,init);
+  };
+  const registration=await send('/api/hosts','POST',ownerToken,{name:'Desktop'});
+  assert.equal(registration.status,201);
+  const {host,token}=await registration.json();
+  assert.equal((await send('/api/session','GET',token)).status,401);
+  assert.equal((await send('/api/host/heartbeat','POST',ownerToken,{})).status,401);
+  assert.equal((await send('/api/host/heartbeat','POST',token,{})).status,200);
+  const route='/api/hosts/'+host.id+'/status-checks';
+  assert.equal((await send(route,'POST',token,{clientRequestId:'forged'})).status,401);
+  assert.equal((await send(route,'POST',ownerToken,{clientRequestId:'arbitrary',command:'ls'})).status,400);
+  const queued=await send(route,'POST',ownerToken,{clientRequestId:'ok'});
+  assert.equal(queued.status,201);
+  const {check:requested}=await queued.json();
+  const {check}=await (await send('/api/host/status-checks/claim','POST',token,{requestId:'one'})).json();
+  assert.equal(check.id,requested.id);
+  assert.equal(check.action,'report_status');
+  const ack='/api/host/status-checks/'+check.id+'/ack';
+  assert.equal((await send(ack,'POST',token,{receiptId:check.receiptId,result:{platform:'linux',connectorVersion:'0.1.0',secret:'rejected'}})).status,400);
+  assert.equal((await send(ack,'POST',token,{receiptId:check.receiptId,result:{platform:'linux',connectorVersion:'0.1.0'}})).status,200);
+  assert.equal((await send('/api/hosts/'+host.id+'/revoke','POST',ownerToken,{})).status,200);
+  assert.equal((await send('/api/host/heartbeat','POST',token,{})).status,401);
+});

@@ -1,2 +1,21 @@
-# agent-workspace
-A private-by-default group-chat workspace for human and AI agent collaboration.
+# Agent Workspace
+
+群聊式开发工作台。代码仓库公开，运行实例默认只监听本机，不开放公网。
+
+## 本地运行
+
+需要 Node.js 24。通过本机安全配置注入至少 32 个字符的 `WORKSPACE_TOKEN`，不要提交凭据。可通过 `WORKSPACE_DATA_DIR` 选择持久目录；默认只监听 127.0.0.1:4319。
+
+```sh
+npm test
+npm start
+```
+
+访问 http://127.0.0.1:4319/。首次进入用本机配置的令牌登录。普通消息写入群历史；从成员列表选定明确的 @ 才登记提醒。产生提醒不等于已启动真实 Agent。
+
+- [功能、范围与验收](Features.md)
+- [交付阶段与当前边界](docs/IMPLEMENTATION.md)
+- [测试和质量门禁](docs/TESTING.md)
+- [台式机部署](docs/DEPLOYMENT.md)
+
+当前版本未声称通过真实模型接入、外部设备或跨主机执行验收。运行数据、浏览器登录和模型凭据不属于此仓库。
