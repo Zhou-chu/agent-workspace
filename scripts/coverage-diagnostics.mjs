@@ -118,17 +118,36 @@ function newMetricValue(row) {
   return current??legacy??row.value;
 }
 
-function measureValues(rows) {
+function measureValues(rows, scope, exclusions) {
   if(!Array.isArray(rows)||rows.length>100) fail('invalid-measures');
-  const values={};
+  const values={}, rejected=new Set(), seen=new Set();
+  const reject=(key,reason)=>{
+    delete values[key];
+    rejected.add(key);
+    const label=scope+'|'+key+'|'+reason;
+    exclusions.set(label,(exclusions.get(label)??0)+1);
+  };
   for(const row of rows){
     const key=row?.metric;
     if(!metricKeys.includes(key)) continue;
-    const s=key.startsWith('new_') ? newMetricValue(row) : row.value;
+    if(seen.has(key)){
+      if(!rejected.has(key)) reject(key,'duplicate-metric');
+      continue;
+    }
+    seen.add(key);
+    let s;
+    try {
+      s=key.startsWith('new_') ? newMetricValue(row) : row.value;
+    } catch(e) {
+      if(!(e instanceof CoverageDiagnosticError)) throw e;
+      reject(key,e.message);
+      continue;
+    }
     if(s===undefined||s===null) continue;
-    const value=percentKeys.has(key)&&typeof s==='string'&&/^(?:0|[1-9]\d{0,2})(?:\.\d{1,8})?$/.test(s)&&Number(s)<=100
-      ? Number(s) : parseNonnegative(s);
-    if(value===null||(percentKeys.has(key)&&value>100)||Object.hasOwn(values,key)) fail('invalid-metric-value');
+    const value=percentKeys.has(key)
+      ? (typeof s==='string'&&/^(?:0|[1-9]\d{0,2})(?:\.\d{1,8})?$/.test(s)&&Number(s)<=100 ? Number(s) : null)
+      : parseNonnegative(typeof s==='string'?s.replace(/\.0{1,8}$/,''):s);
+    if(value===null){reject(key,'invalid-value');continue;}
     values[key]=value;
   }
   return values;
@@ -151,7 +170,7 @@ export async function collectCoverage({receipt,token,revision,tracked,lcov,read=
   const before=await latest();
   const metricString=metricKeys.join(',');
   const files=[];
-  const seen=new Set();
+  const seen=new Set(), exclusions=new Map();
   let omitted=0, expectedTotal=null;
   for(let page=1;page<=Math.ceil(maxFiles/pageSize);page++){
     const {baseComponent,paging,components}=await jsonRequest('/api/measures/component_tree',
@@ -166,15 +185,15 @@ export async function collectCoverage({receipt,token,revision,tracked,lcov,read=
       if(!trackedPath(entry?.path,tracked)){omitted++;continue;}
       if(seen.has(entry.path)) fail('duplicate-measures-path');
       seen.add(entry.path);
-      files.push({path:entry.path,metrics:measureValues(entry.measures??[])});
+      files.push({path:entry.path,metrics:measureValues(entry.measures??[],'file',exclusions)});
     }
     if(page*pageSize>=paging.total) break;
   }
   const whole=(await jsonRequest('/api/measures/component',{component:project,branch,metricKeys:metricString},token,read))?.component;
   if(whole?.key!==project||!files.length) fail('missing-measures');
-  const metrics=measureValues(whole.measures??[]);
+  const metrics=measureValues(whole.measures??[],'project',exclusions);
   if(await latest()!==before) fail('analysis-changed');
-  return {revision,metrics,files:files.sort((a,b)=>a.path.localeCompare(b.path)),inventory,omitted};
+  return {revision,metrics,files:files.sort((a,b)=>a.path.localeCompare(b.path)),inventory,omitted,exclusions};
 }
 
 export function renderCoverage(report) {
@@ -196,6 +215,14 @@ export function renderCoverage(report) {
   if(lookup.size){
     out.push('', 'LCOV entries absent from the Sonar file-measure response:');
     for(const x of lookup.values()) out.push(`- \`${x.path}\`: lines ${x.LH}/${x.LF}; conditions ${x.BRH}/${x.BRF}`);
+  }
+  if(report.exclusions.size){
+    out.push('', 'Invalid or ambiguous Sonar metrics omitted from this report:', '',
+      '| Scope | Metric | Reason | Affected entries |','|---|---|---|---:|');
+    for(const [label,count] of [...report.exclusions].sort(([a],[b])=>a.localeCompare(b))){
+      const [scope,key,reason]=label.split('|');
+      out.push('| '+scope+' | `'+key+'` | `'+reason+'` | '+count+' |');
+    }
   }
   if(report.omitted) out.push('', `${report.omitted} Sonar file entr${report.omitted===1?'y was':'ies were'} omitted because a safe tracked path could not be confirmed.`);
   return out.join('\n')+'\n';

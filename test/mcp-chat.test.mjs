@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
+import { Writable } from 'node:stream';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createChatBridge } from '../connector/mcp-chat.mjs';
+import { createChatBridge, serveStdio } from '../connector/mcp-chat.mjs';
 
 const origin='http://127.0.0.1:4319';
 const agent='aw_agent_'+'a'.repeat(43);
@@ -129,4 +130,78 @@ test('child rejects a host token at startup without emitting RPC frames or secre
   assert.equal(stdout,'');
   assert.match(stderr,/dedicated Workspace Agent token/);
   assert.ok(!stderr.includes(wrongToken));
+});
+
+test('thread pages preserve authorized task and reply references without consuming unrelated messages',async t=>{
+  const {createWorkspaceServer}=await import('../server/index.mjs');
+  const {openWorkspace}=await import('../server/workspace.mjs');
+  const store=openWorkspace(':memory:');
+  const {agent:lee,token}=store.createAgent(store.owner,{name:'Lee'});
+  const task=store.createTask(store.owner,{roomId:'general',title:'Check build notes',assigneeId:lee.id});
+  const root=store.send(store.owner,'general',{clientRequestId:'thread-root',body:'Build notes',taskRef:task.id});
+  store.send(store.owner,'general',{clientRequestId:'unrelated',body:'Unrelated planning'});
+  const server=createWorkspaceServer({store,ownerToken:'another-synthetic-token-at-least-32-long'});
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{await new Promise(r=>server.close(r));store.close();});
+  const bridge=createChatBridge({...options,token,baseUrl:'http://127.0.0.1:'+server.address().port});
+  let result=await bridge.call(tool('chat_send',{roomId:'general',clientRequestId:'notes',body:'Notes checked.',replyTo:root.id,taskRef:task.id}));
+  assert.equal(result.isError,undefined);
+  const reply=data(result).message;
+  assert.equal(reply.replyTo,root.id);
+  assert.equal(reply.taskRef,task.id);
+
+  const args={roomId:'general',thread:root.id,limit:1};
+  const first=data(await bridge.call(tool('chat_read',args)));
+  assert.deepEqual(first.messages.map(message=>message.id),[root.id]);
+  assert.equal(first.hasMore,true);
+  const next=data(await bridge.call(tool('chat_read',{...args,after:first.nextCursor})));
+  assert.deepEqual(next.messages.map(message=>message.id),[reply.id]);
+  assert.equal(next.messages[0].taskRef,task.id);
+  assert.equal(next.hasMore,false);
+  assert.deepEqual(data(await bridge.call(tool('chat_read',{roomId:'general',limit:2}))).messages.map(message=>message.body),['Build notes','Unrelated planning']);
+
+  store.setAgentEnabled(store.owner,lee.id,false);
+  result=await bridge.call(tool('chat_read',args));
+  assert.equal(result.isError,true);
+  assert.match(result.content[0].text,/401/);
+});
+
+test('stdio recovers from mixed framing, incomplete EOF, and invalid initialization without acting',async()=>{
+  const frame=(id,method,params)=>JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n';
+  const seen=[];
+  const output=new Writable({write(chunk,_encoding,done){seen.push(JSON.parse(chunk.toString()));done();}});
+  async function* chunks(){
+    yield 'not JSON\n'+JSON.stringify([1,2])+'\n';
+    yield Buffer.from(frame('bad','initialize',{protocolVersion:42}));
+    const next=frame('start','initialize',{protocolVersion:'future-client'});
+    yield next.slice(0,21);
+    yield next.slice(21)+frame(null,'ping')+frame('again','initialize',{protocolVersion:'2025-06-18'});
+    yield frame(undefined,'notifications/initialized')+frame('list','tools/list',{}).trimEnd();
+  }
+  await serveStdio({call(){assert.fail('Malformed or incomplete frames must not invoke tools');}},{input:chunks(),output});
+  assert.deepEqual(seen.map(x=>[x.id,x.error?.code??x.result.protocolVersion]),[
+    [null,-32700],[null,-32600],['bad',-32602],['start','2025-11-25'],[null,-32600],['again',-32602],[null,-32700],
+  ]);
+});
+
+test('malformed optional references are rejected before transport and disconnects give a generic tool error',async()=>{
+  let calls=0;
+  const bridge=createChatBridge({...options,fetchImpl:async()=>{
+    calls++;
+    throw new Error('simulated disconnected upstream '+agent);
+  }});
+  const messageArgs={roomId:'general',clientRequestId:'req',body:'Reply'};
+  for(const params of [
+    tool('chat_read',{roomId:'general',after:'not-a-cursor'}),
+    tool('chat_read',{roomId:'general',thread:null}),
+    tool('chat_send',{...messageArgs,replyTo:'bad path'}),
+    tool('chat_send',{...messageArgs,taskRef:7}),
+    null,
+  ]) assert.equal((await bridge.call(params)).isError,true);
+  assert.equal(calls,0);
+  const failure=await bridge.call(tool('chat_read',{roomId:'general'}));
+  assert.equal(calls,1);
+  assert.equal(failure.isError,true);
+  assert.match(failure.content[0].text,/transport failed/);
+  assert.ok(!failure.content[0].text.includes(agent));
 });

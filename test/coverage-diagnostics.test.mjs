@@ -86,10 +86,21 @@ test('API errors keep raw service bodies and origin redirects out of errors',asy
     {message:'sonar-http-403'});
   await assert.rejects(collectCoverage({...base,read:async()=>{throw new Error('raw transport internal');}}),
     {message:'sonar-api-unavailable'});
+});
+
+test('one malformed file metric is omitted with a bounded reason, not its raw value',async()=>{
   const {fetchMock}=service({responseOverrides:{components:[
-    {path:'server/index.mjs',measures:[measure('coverage','101.2')]},
+    {path:'server/index.mjs',measures:[measure('coverage','101.2'),period('new_lines_to_cover','2.0'),
+      measure('lines_to_cover','PRIVATE fixture'),measure('uncovered_lines','1'),
+      measure('uncovered_lines','2'),measure('vendor_secret_metric','never show')]},
   ],paging:{total:1,pageSize:100,pageIndex:1}}});
-  await assert.rejects(collectCoverage({...base,read:fetchMock}),{message:'invalid-metric-value'});
+  const report=await collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock});
+  assert.deepEqual(report.files[0].metrics,{new_lines_to_cover:2});
+  const out=renderCoverage(report);
+  assert.match(out,/file.*coverage.*invalid-value.*1/);
+  assert.match(out,/file.*uncovered_lines.*duplicate-metric.*1/);
+  assert.match(out,/server\/index.mjs/);
+  assert.doesNotMatch(out,/101\.2|PRIVATE fixture|vendor_secret_metric|never show/);
 });
 
 test('CLI refuses out-of-scope GitHub refs before any scan read',async t=>{
@@ -142,6 +153,10 @@ test('ambiguous legacy period data is not resolved by guessing',async()=>{
   const {fetchMock}=service({componentOverrides:{measures:[
     {metric:'new_coverage',periods:[{index:1,value:'77.1'},{index:1,value:'39.5'}]},
   ]}});
-  await assert.rejects(collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock}),
-    {message:'ambiguous-metric-period'});
+  const report=await collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock});
+  assert.equal(report.metrics.new_coverage,undefined);
+  assert.equal(report.files[0].metrics.new_coverage,49.6);
+  const rendered=renderCoverage(report);
+  assert.match(rendered,/project.*new_coverage.*ambiguous-metric-period.*1/);
+  assert.doesNotMatch(rendered,/77\.1|39\.5/);
 });

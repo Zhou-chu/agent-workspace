@@ -107,6 +107,14 @@ async function harness(t) {
     dom, d, requests, wait, named, find, element, click, text, field, submit, deviceCall, login,
     intercept(handler) { intercept = handler; },
     tick() { tick(); },
+    async asAnotherOwnerClient(method, path, payload) {
+      const response = await nativeFetch(origin + path, {
+        method,
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: payload === undefined ? undefined : JSON.stringify(payload),
+      });
+      return [response.status, await response.json()];
+    },
     invalidateCookie() { cookie = 'workspace_session=expired'; },
   };
 }
@@ -210,6 +218,48 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
   await h.find('button', '加入群聊');
   });
   h.intercept(null);
+  await t.test('larger room history stays bounded and keyboard focus survives refresh', async () => {
+    for (let i = 0; i < 61; i++) {
+      const [status] = await h.asAnotherOwnerClient('POST', '/api/rooms/general/messages', {
+        clientRequestId: 'history-' + i,
+        body: 'history message ' + i,
+      });
+      assert.equal(status, 201);
+    }
+    await h.click('General');
+    await h.find('h1', 'General');
+    assert.equal(h.d.activeElement, h.named('h1', 'General'));
+    await h.find('button', '加载更多消息');
+    assert.equal(h.d.querySelectorAll('.message').length, 60);
+    assert.equal(h.named('.message .body', 'history message 60'), undefined);
+    await h.click('加载更多消息');
+    await h.find('.message .body', 'history message 60');
+    assert.equal(h.d.querySelectorAll('.message').length, 61);
+    assert.equal(h.named('button', '加载更多消息'), undefined);
+
+    const message = h.named('.message .body', 'history message 60').closest('[data-message]');
+    const originalReply = message.querySelector('button[aria-label="回复"]');
+    originalReply.focus();
+    const [added] = await h.asAnotherOwnerClient('POST', '/api/rooms/general/messages', {
+      clientRequestId: 'second-client-new', body: 'message from another client',
+    });
+    assert.equal(added, 201);
+    h.tick();
+    await h.find('.message .body', 'message from another client');
+    const next = [...h.d.querySelectorAll('[data-message]')].find(item => item.dataset.message === message.dataset.message);
+    assert.notEqual(next, message);
+    assert.equal(h.d.activeElement, next.querySelector('button[aria-label="回复"]'));
+
+    const draft = h.field('消息正文', 'keyboard send');
+    draft.dispatchEvent(new h.dom.window.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, isComposing: true, bubbles: true }));
+    assert.equal(h.named('.message .body', 'keyboard send'), undefined);
+    draft.dispatchEvent(new h.dom.window.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+    await h.find('.message .body', 'keyboard send');
+    await h.click('返回群聊列表');
+    assert.equal(h.d.activeElement, h.named('button', 'General'));
+    await h.click('Side room');
+    await h.find('h1', 'Side room');
+  });
   await t.test('decision, versioned task lifecycle and local settings remain usable', async () => {
     await h.click('待处理');
     await h.click('新建决定事项', 'summary');
@@ -227,6 +277,15 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     assert.equal(h.named('button', '标记处理中').classList.contains('primary'), true);
     assert.equal(h.named('button', '标记受阻').classList.contains('primary'), false);
     assert.equal(h.named('button', '取消任务').classList.contains('task-cancel'), true);
+    const [listed, current] = await h.asAnotherOwnerClient('GET', '/api/tasks');
+    assert.equal(listed, 200);
+    const task = current.tasks.find(item => item.title === 'Review follow-up');
+    const [updated] = await h.asAnotherOwnerClient('PATCH', '/api/tasks/' + task.id, { status: 'blocked', expectedVersion: task.version });
+    assert.equal(updated, 200);
+    await h.click('标记处理中');
+    await h.text('状态已更新，请刷新任务后重试。');
+    await h.click('刷新');
+    await h.find('.badge', '受阻');
     await h.click('标记处理中');
     await h.find('.badge', '处理中');
     await h.click('请求验收');
@@ -261,8 +320,23 @@ test('workspace UI integrates with HTTP and SQLite across one owner session', as
     await h.click('刷新设备');
     await h.find('.badge', '在线');
     await h.click('连接详情', 'summary');
+    const statusIds = [];
+    h.intercept(async (call, work) => {
+      if (call.method !== 'POST' || !call.path.endsWith('/status-checks')) return work();
+      statusIds.push(call.body.clientRequestId);
+      const response = await work();
+      if (statusIds.length > 1) return response;
+      await response.json();
+      throw new Error('test network drop after request');
+    });
+    await h.click('请求只读检查');
+    await h.text('未确认创建检查');
     await h.click('请求只读检查');
     await h.find('.badge', '等待设备领取');
+    assert.equal(statusIds.length, 2);
+    assert.equal(statusIds[0], statusIds[1]);
+    assert.equal([...h.d.querySelectorAll('.badge')].filter(row => row.textContent === '等待设备领取').length, 1);
+    h.intercept(null);
     const [claimed, result] = await host('/api/host/status-checks/claim', { requestId: 'claim-1' });
     assert.equal(claimed, 200);
     await h.click('刷新回执');
