@@ -42,3 +42,10 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_RECEIPT: ${{ runner.temp }}/agent-workspace-sonar-receipt.txt
         run: node scripts/sonar-gate.mjs
+      - name: Reconcile Sonar and hosted LCOV coverage
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (steps.sonar_scan.outcome == 'success' || steps.sonar_scan.outcome == 'failure') }}
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_RECEIPT: ${{ runner.temp }}/agent-workspace-sonar-receipt.txt
+        run: node scripts/coverage-diagnostics.mjs
