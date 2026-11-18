@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci --ignore-scripts
+      - name: Check runtime module boundaries
+        if: runner.os == 'Linux'
+        run: npm run check:architecture
       - run: npm test
       - name: Verify Windows bootstrap executable selection
         if: runner.os == 'Windows'
