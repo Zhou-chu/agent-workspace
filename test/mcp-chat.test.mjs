@@ -46,9 +46,17 @@ test('bridge allows only typed chat endpoints, never forwards secrets or redirec
 });
 
 test('fail closed on forbidden or oversize responses, without echoing server error bodies',async()=>{
-  const responses=[json({error:agent},401),new Response('x'.repeat(1_300_000)),new Response('',{status:302,headers:{Location:'https://else.invalid/'}})];
+  const responses=[
+    json({error:agent},401),
+    new Response('x'.repeat(1_300_000)),
+    new Response('',{status:302,headers:{Location:'https://else.invalid/'}}),
+    new Response(null,{status:204}),
+    json([]),
+    json({messages:[],nextCursor:agent,hasMore:false}),
+    json({messages:[{...message,roomId:'a-different-room',body:agent}],nextCursor:'1',hasMore:false}),
+  ];
   const bridge=createChatBridge({...options,fetchImpl:async()=>responses.shift()});
-  for(let i=0;i<3;i++){
+  while(responses.length){
     const result=await bridge.call(tool('chat_read',{roomId:'general'}));
     assert.equal(result.isError,true);
     assert.ok(!JSON.stringify(result).includes(agent));
@@ -73,6 +81,8 @@ test('child stdio handshake and allowlist are offline and keep stdout JSON-RPC o
   send('tools/call',4,tool('unknown',{}));assert.equal((await receive()).result.isError,true);
   child.stdin.write('x'.repeat(70_000)+'\n');assert.equal((await receive()).error.message,'Request frame exceeds the bridge limit');
   send('ping',5);assert.deepEqual((await receive()).result,{});
+  send('resources/list',6);assert.equal((await receive()).error.code,-32601);
+  send('tools/list',7,{cursor:'not-supported'});assert.equal((await receive()).error.code,-32602);
   child.stdin.end();assert.deepEqual(await exited,[0,null]);assert.equal(stderr,'');
 });
 
@@ -102,4 +112,21 @@ test('actual SQLite/HTTP exercise: membership, explicit retrieval, idempotency, 
   const reminders=store.listReminders(store.authenticateAgent(target.token));
   assert.equal(reminders.length,1);
   assert.equal(reminders[0].status,'blocked_no_execution_context');
+});
+
+test('child rejects a host token at startup without emitting RPC frames or secrets',{timeout:5000},async t=>{
+  const wrongToken='aw_host_'+'z'.repeat(43);
+  const child=spawn(process.execPath,[fileURLToPath(new URL('../connector/mcp-chat.mjs',import.meta.url))],{
+    env:{...process.env,WORKSPACE_MCP_ORIGIN:origin,WORKSPACE_MCP_AGENT_TOKEN:wrongToken,WORKSPACE_MCP_CONSUMER_ID:'wrong-scope'},
+    stdio:['ignore','pipe','pipe'],
+  });
+  let stdout='',stderr='';
+  child.stdout.setEncoding('utf8').on('data',v=>stdout+=v);
+  child.stderr.setEncoding('utf8').on('data',v=>stderr+=v);
+  const closed=once(child,'close');
+  t.after(()=>child.kill());
+  assert.deepEqual(await closed,[1,null]);
+  assert.equal(stdout,'');
+  assert.match(stderr,/dedicated Workspace Agent token/);
+  assert.ok(!stderr.includes(wrongToken));
 });

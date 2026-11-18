@@ -13,7 +13,7 @@ const period=(metric,value)=>({metric,period:{value}});
 const measures=[measure('coverage','50.0'),period('new_coverage','49.6'),
   measure('lines_to_cover','2'),measure('uncovered_lines','1'),period('new_lines_to_cover','2'),
   period('new_uncovered_lines','1'),measure('conditions_to_cover','2'),measure('uncovered_conditions','1')];
-function service({latestAfter={},latestBefore={},taskOverrides={},responseOverrides={}}={}) {
+function service({latestAfter={},latestBefore={},taskOverrides={},responseOverrides={},componentOverrides={}}={}) {
   let catalogueCount=0;
   const calls=[];
   const fetchMock=async (url,init)=>{
@@ -34,7 +34,7 @@ function service({latestAfter={},latestBefore={},taskOverrides={},responseOverri
       ],paging:{total:3,pageSize:100,pageIndex:1},...responseOverrides,
     });
     if (url.pathname==='/api/measures/component') return Response.json({
-      component:{key,measures},period:{mode:'PREVIOUS_VERSION',date},extra:'DO NOT PRINT RAW',
+      component:{key,measures,...componentOverrides},period:{mode:'PREVIOUS_VERSION',date},extra:'DO NOT PRINT RAW',
     });
     throw new Error('unexpected route');
   };
@@ -110,4 +110,38 @@ test('CLI refuses out-of-scope GitHub refs before any scan read',async t=>{
   assert.match(proc.stdout,/diagnostic-ref-scope/);
   assert.doesNotMatch(proc.stdout,/privateFixture|private-fixture-location/);
   assert.equal(await readFile(summary,'utf8'),proc.stdout);
+});
+
+test('missing project aggregate percentages retain verified per-file numbers',async()=>{
+  const {fetchMock,calls}=service({componentOverrides:{measures:[
+    measure('lines_to_cover','42'),
+  ]}});
+  const report=await collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock});
+  assert.equal(report.metrics.lines_to_cover,42);
+  assert.equal(report.metrics.new_coverage,undefined);
+  assert.equal(report.metrics.coverage,undefined);
+  assert.equal(report.files.find(f=>f.path==='server/index.mjs').metrics.new_coverage,49.6);
+  assert.equal(calls.at(-1),'/api/project_analyses/search');
+  assert.match(renderCoverage(report),/Project aggregate `coverage`, `new_coverage` not returned/);
+});
+
+test('singular and legacy periods use the documented active period, not array order or a different baseline',async()=>{
+  const {fetchMock}=service({componentOverrides:{measures:[
+    {metric:'coverage',period:{index:1,value:'72.1'}},
+    {metric:'new_coverage',periods:[{index:2,value:'80.2'},{index:1,value:'76.8'}]},
+    {metric:'new_lines_to_cover',period:{index:1,value:'100'},periods:[{index:1,value:'100'}]},
+    {metric:'new_uncovered_lines',periods:[{index:2,value:'900'}]},
+    {metric:'new_conditions_to_cover',value:'5'},
+  ]}});
+  const report=await collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock});
+  assert.deepEqual(report.metrics,{new_coverage:76.8,new_lines_to_cover:100,new_conditions_to_cover:5});
+  assert.match(renderCoverage(report),/Project aggregate `coverage` not returned/);
+});
+
+test('ambiguous legacy period data is not resolved by guessing',async()=>{
+  const {fetchMock}=service({componentOverrides:{measures:[
+    {metric:'new_coverage',periods:[{index:1,value:'77.1'},{index:1,value:'39.5'}]},
+  ]}});
+  await assert.rejects(collectCoverage({receipt,token:'privateFixture',revision:sha,tracked,lcov,read:fetchMock}),
+    {message:'ambiguous-metric-period'});
 });

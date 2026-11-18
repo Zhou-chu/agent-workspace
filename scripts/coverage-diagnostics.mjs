@@ -100,13 +100,31 @@ async function jsonRequest(path, params, token, read) {
   }
 }
 
+function newMetricValue(row) {
+  // SonarQube 8.1 moved from measure.periods[] to measure.period. A legacy
+  // array can contain different baselines, so only use its active index 1.
+  const singular=row.period;
+  const current = singular && (singular.index===undefined || singular.index===1) ? singular.value : undefined;
+  const periods=row.periods;
+  let legacy;
+  if(periods!==undefined&&periods!==null){
+    if(!Array.isArray(periods)||periods.length>10) fail('invalid-metric-period');
+    const active=periods.filter(item=>item?.index===1);
+    if(active.length>1) fail('ambiguous-metric-period');
+    if(active.length===1) legacy=active[0].value;
+    else if(periods.length===1&&periods[0]&&periods[0].index===undefined) legacy=periods[0].value;
+  }
+  if(current!=null&&legacy!=null&&current!==legacy) fail('ambiguous-metric-period');
+  return current??legacy??row.value;
+}
+
 function measureValues(rows) {
   if(!Array.isArray(rows)||rows.length>100) fail('invalid-measures');
   const values={};
   for(const row of rows){
     const key=row?.metric;
     if(!metricKeys.includes(key)) continue;
-    const s=key.startsWith('new_') ? row.period?.value??row.value : row.value??row.period?.value;
+    const s=key.startsWith('new_') ? newMetricValue(row) : row.value;
     if(s===undefined||s===null) continue;
     const value=percentKeys.has(key)&&typeof s==='string'&&/^(?:0|[1-9]\d{0,2})(?:\.\d{1,8})?$/.test(s)&&Number(s)<=100
       ? Number(s) : parseNonnegative(s);
@@ -154,8 +172,7 @@ export async function collectCoverage({receipt,token,revision,tracked,lcov,read=
   }
   const whole=(await jsonRequest('/api/measures/component',{component:project,branch,metricKeys:metricString},token,read))?.component;
   if(whole?.key!==project||!files.length) fail('missing-measures');
-  const metrics=measureValues(whole.measures);
-  if(!Object.hasOwn(metrics,'new_coverage')||!Object.hasOwn(metrics,'coverage')) fail('missing-project-coverage');
+  const metrics=measureValues(whole.measures??[]);
   if(await latest()!==before) fail('analysis-changed');
   return {revision,metrics,files:files.sort((a,b)=>a.path.localeCompare(b.path)),inventory,omitted};
 }
@@ -164,6 +181,8 @@ export function renderCoverage(report) {
   const out=['### SonarQube coverage reconciliation (read-only)','',`Exact main revision: \`${report.revision}\`.`,
     '', 'Project coverage metrics:', '', '| Metric | Value |','|---|---:|'];
   for(const key of metricKeys) if(report.metrics[key]!==undefined) out.push(`| \`${key}\` | ${report.metrics[key]} |`);
+  const absent=['coverage','new_coverage'].filter(key=>!Object.hasOwn(report.metrics,key));
+  if(absent.length) out.push('', 'Project aggregate '+absent.map(key=>'`'+key+'`').join(', ')+' not returned. No value was imputed; exact-analysis file measures follow.');
   const lookup=new Map(report.inventory.map(row=>[row.path,row]));
   out.push('', 'Counts are totals, not uncovered counts, except where labeled missed. Blank means the service did not return a value.',
     '', '| Tracked file | Sonar lines / missed | Sonar conditions / missed | Sonar new lines / missed | Sonar new conditions / missed | Sonar new % | LCOV lines hit / total | LCOV conditions hit / total |',
