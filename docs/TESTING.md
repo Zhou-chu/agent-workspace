@@ -1,6 +1,7 @@
 # Testing and hosted quality checks
 
 - `node --test test/core-workspace.test.mjs test/api-workspace.test.mjs`: persistence, identity, room scope, alerts vs passive chat, idempotency, trusted decisions and lifecycle transitions.
+- `node --test test/mcp-chat.test.mjs test/api-task-artifacts.test.mjs test/ui-integration.test.mjs`: chat and explicit decision MCP semantics, task artifact authorization, immutable downloads, and lost-response retry. Local fixtures are not real model turns or remote artifact transfers.
 - `node --test test/connector-status.test.mjs`: host heartbeat and approved status-only action, recovery from a lost receipt, token revocation. No models or arbitrary execution.
 - `node --test test/ui-contract.test.mjs`: UI message semantics and exact local payloads. These tests do not certify real browser/mobile rendering.
 - `node --test test/deploy-desktop.test.mjs`: exact GitHub main/CI selection, loopback defaults and rollback-related configuration. Does not certify deployment.

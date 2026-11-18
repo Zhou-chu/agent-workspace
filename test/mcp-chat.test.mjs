@@ -15,7 +15,7 @@ const data=result=>JSON.parse(result.content[0].text);
 const json=(value,status=200)=>new Response(JSON.stringify(value),{status});
 const message={id:'m1',roomId:'general',authorId:'agent-1',authorName:'A',authorKind:'agent',body:'Hello',mentions:[],replyTo:null,taskRef:null,createdAt:new Date(0).toISOString()};
 
-test('bridge allows only typed chat endpoints, never forwards secrets or redirects, and requires a stable mutation ID',async()=>{
+test('bridge allows only typed workspace endpoints, never forwards secrets or redirects, and requires a stable mutation ID',async()=>{
   const requests=[];
   const bridge=createChatBridge({...options,fetchImpl:async (url,init)=>{
     requests.push([new URL(url),init]);
@@ -78,7 +78,7 @@ test('child stdio handshake and allowlist are offline and keep stdout JSON-RPC o
   send('initialize',2,{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'test',version:'1.0'}});
   const initialize=await receive();assert.equal(initialize.result.protocolVersion,'2025-06-18');assert.deepEqual(initialize.result.capabilities,{tools:{}});
   send('notifications/initialized');send('tools/list',3);
-  const list=await receive();assert.deepEqual(list.result.tools.map(x=>x.name),['chat_read','chat_send']);
+  const list=await receive();assert.deepEqual(list.result.tools.map(x=>x.name),['chat_read','chat_send','tasks_request_decision']);
   send('tools/call',4,tool('unknown',{}));assert.equal((await receive()).result.isError,true);
   child.stdin.write('x'.repeat(70_000)+'\n');assert.equal((await receive()).error.message,'Request frame exceeds the bridge limit');
   send('ping',5);assert.deepEqual((await receive()).result,{});
@@ -204,4 +204,84 @@ test('malformed optional references are rejected before transport and disconnect
   assert.equal(failure.isError,true);
   assert.match(failure.content[0].text,/transport failed/);
   assert.ok(!failure.content[0].text.includes(agent));
+});
+
+test('explicit MCP decision is scoped, idempotent, and never inferred from chat',async t=>{
+  const {createWorkspaceServer}=await import('../server/index.mjs');
+  const {openWorkspace}=await import('../server/workspace.mjs');
+  const store=openWorkspace(':memory:');
+  const {agent:requester,token}=store.createAgent(store.owner,{name:'Requester'});
+  const {agent:peer,token:peerToken}=store.createAgent(store.owner,{name:'Peer'});
+  const outside=store.createRoom(store.owner,{name:'Other room'});
+  const outsideMessage=store.send(store.owner,outside.id,{clientRequestId:'outside',body:'private'});
+  const source=store.send(store.owner,'general',{clientRequestId:'root',body:'Prepare summary'});
+  const assigned=store.createTask(store.owner,{roomId:'general',assigneeId:requester.id,title:'Prepare'});
+  const forbidden=store.createTask(store.owner,{roomId:'general',assigneeId:peer.id,title:'Other'});
+  const ownerToken='synthetic-owner-token-at-least-32-chars';
+  const server=createWorkspaceServer({store,ownerToken});
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{await new Promise(r=>server.close(r));store.close();});
+  const baseUrl='http://127.0.0.1:'+server.address().port;
+  const bridge=createChatBridge({...options,token,baseUrl});
+  const ask={clientRequestId:'decision-1',roomId:'general',taskRef:assigned.id,
+    messageRef:source.id,question:'Which format?',options:['Markdown','PDF']};
+  const call=arg=>bridge.call(tool('tasks_request_decision',{...ask,...arg}));
+
+  const sent=await bridge.call(tool('chat_send',{roomId:'general',clientRequestId:'plain',
+    body:'Which format? @Peer'}));
+  assert.equal(sent.isError,undefined);
+  assert.equal(store.listDecisions(store.owner).length,0);
+  assert.equal(store.listReminders(peer).length,0);
+
+  for(const invalid of [{taskRef:forbidden.id},{messageRef:outsideMessage.id},{roomId:outside.id},
+    {ownerId:peer.id},{authorId:'owner'},{options:['same',' same ']},{clientRequestId:null}]){
+    assert.equal((await call(invalid)).isError,true);
+  }
+  const both=await Promise.all([call({}),call({})]);
+  assert.equal(both[0].isError,undefined);
+  assert.deepEqual(data(both[0]),data(both[1]));
+  const d=data(both[0]).decision;
+  assert.equal(d.status,'pending');
+  assert.equal(d.authorId,requester.id);
+  assert.equal(d.ownerId,store.owner.id);
+  assert.equal(d.taskRef,assigned.id);
+  assert.equal(d.messageRef,source.id);
+  assert.match((await call({question:'Different'})).content[0].text,/409/);
+  assert.equal(store.listDecisions(store.owner).length,1);
+  assert.equal(store.listDecisions(peer).length,0);
+  const api=async (path,bearer,payload)=>fetch(baseUrl+path,{method:'POST',
+    headers:{Authorization:'Bearer '+bearer,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const resolution='/api/decisions/'+d.id+'/resolve';
+  assert.equal((await api(resolution,peerToken,{response:'PDF'})).status,403);
+  const handled=await api(resolution,ownerToken,{response:'PDF'});
+  assert.equal(handled.status,200);
+  assert.equal((await handled.json()).decision.status,'resolved');
+  assert.equal(data(await call({})).decision.response,'PDF');
+  const ownerMade=await api('/api/decisions',ownerToken,{roomId:'general',question:'Still works?',options:['Yes','No']});
+  assert.equal(ownerMade.status,201);
+  assert.equal((await ownerMade.json()).decision.authorId,store.owner.id);
+  assert.equal(store.listReminders(peer).length,0);
+  assert.equal(store.listMessages(store.owner,'general',{}).messages.length,2);
+  store.setRoomMember(store.owner,'general',requester.id,false);
+  assert.match((await call({})).content[0].text,/404/);
+  store.setAgentEnabled(store.owner,requester.id,false);
+  assert.match((await call({})).content[0].text,/401/);
+});
+
+test('decision bridge rejects mismatched or malformed API responses without echoing extra data',async()=>{
+  const ask={roomId:'general',clientRequestId:'new',question:'Choose',options:['A','B']};
+  const d={id:'decision-1',roomId:'general',taskRef:null,messageRef:null,
+    ownerId:'owner',authorId:'agent-1',question:ask.question,options:ask.options,status:'pending',
+    response:null,createdAt:new Date(0).toISOString()};
+  const responses=[{...d,taskRef:'foreign'},{...d,status:'resolved',response:'C'},
+    {...d,roomId:'another'},{...d,createdAt:null},{...d,arbitrary:agent}];
+  const bridge=createChatBridge({...options,fetchImpl:async(url,init)=>{
+    assert.equal(new URL(url).pathname,'/api/decisions');
+    assert.equal(init.method,'POST');
+    assert.equal(init.redirect,'error');
+    assert.deepEqual(JSON.parse(init.body),ask);
+    return json({decision:responses.shift(),arbitrary:agent},201);
+  }});
+  for(let i=0;i<4;i++) assert.equal((await bridge.call(tool('tasks_request_decision',ask))).isError,true);
+  assert.deepEqual(data(await bridge.call(tool('tasks_request_decision',ask))),{decision:d});
 });

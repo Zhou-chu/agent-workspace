@@ -460,6 +460,57 @@ function roomSelect(rooms) {
   return select;
 }
 function expandable(title, form) { return el('details', {}, el('summary', {}, title), form); }
+function taskArtifacts(task, epoch) {
+  const path='/api/tasks/'+encodeURIComponent(task.id)+'/artifacts';
+  const list=el('div'), feedback=notice('alert');
+  const live=()=>epoch===state.epoch;
+  let loading=false, loaded=false, generation=0, retry;
+  async function refresh() {
+    const attempt=++generation;
+    loading=true;
+    try {
+      const {artifacts}=await api(path);
+      if(!live()||attempt!==generation) return;
+      list.replaceChildren(listRows(artifacts, artifact=>el('div',{class:'row'},
+        el('a',{href:path+'/'+encodeURIComponent(artifact.id),download:''},artifact.name),
+        el('span',{class:'muted'},artifact.bytes+' B')), '暂无产物。'));
+      loaded=true;
+    } catch(error) {
+      if(live()&&attempt===generation) list.replaceChildren(el('p',{role:'alert'},error.message),button('重试加载产物',refresh));
+    } finally { if(attempt===generation) loading=false; }
+  }
+  const details=el('details',{ontoggle:event=>{
+    if(event.currentTarget.open&&!loaded&&!loading) void refresh();
+  }},
+    el('summary',{},'任务产物'),list);
+  const me=state.session.user;
+  if(me.kind==='human'||(me.id===task.assigneeId&&!['accepted','cancelled'].includes(task.status))){
+    const name=el('input',{required:'',maxlength:'120',placeholder:'review.txt / report.md'});
+    const kind=el('select',{},el('option',{value:'text'},'纯文本 (.txt)'),el('option',{value:'markdown'},'Markdown (.md)'));
+    const text=el('textarea',{required:'',maxlength:'24576'});
+    const submit=el('button',{type:'submit'},'添加产物');
+    const form=el('form',{class:'inline-form',onsubmit:async event=>{
+      event.preventDefault();
+      if(submit.disabled) return;
+      submit.disabled=true;
+      feedback.textContent='';
+      const payload={name:name.value.trim(),kind:kind.value,text:text.value};
+      const signature=JSON.stringify(payload);
+      if(retry?.signature!==signature) retry={signature,id:requestId()};
+      try {
+        await post(path,{...payload,clientRequestId:retry.id});
+        if(!live()) return;
+        retry=undefined;
+        if(JSON.stringify({name:name.value.trim(),kind:kind.value,text:text.value})===signature) form.reset();
+        await refresh();
+      } catch(error) {
+        if(live()) feedback.textContent=error.message;
+      } finally { submit.disabled=false; }
+    }},field('文件名',name),field('文件类型',kind),field('产物正文',text),submit,feedback);
+    details.append(form);
+  }
+  return details;
+}
 async function tasksPage(target, epoch) {
   const [{ tasks }, { rooms }] = await Promise.all([api('/api/tasks'), api('/api/rooms')]);
   if (epoch !== state.epoch) return;
@@ -506,7 +557,7 @@ async function tasksPage(target, epoch) {
       task.description ? el('p', { class: 'body' }, task.description) : null,
       el('p', { class: 'muted' }, [rooms.find(room => room.id === task.roomId)?.name ?? '', actorNames.get(task.assigneeId) ?? '未指派', humanTime(task.createdAt)].filter(Boolean).join(' · ')),
       task.dependencyIds?.length ? el('p', { class: 'muted' }, '依赖：' + task.dependencyIds.map(id => tasks.find(item => item.id === id)?.title ?? id).join('、')) : null,
-      actions, feedback);
+      actions, feedback, taskArtifacts(task,epoch));
   }, '暂无任务。'));
 }
 async function agentsPage(target, epoch) {

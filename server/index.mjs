@@ -4,6 +4,7 @@ import { extname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { digest, openWorkspace, reject } from './workspace.mjs';
+import { artifactDisposition } from './artifacts.mjs';
 
 const cookieName = 'workspace_session';
 const cookie = req => (req.headers.cookie??'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1);
@@ -167,6 +168,18 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (messages && method==='POST') return json(res,201,{message:store.send(actor,messages[1],await body(req))});
         const editAgent = /^\/api\/agents\/([0-9a-z-]{1,80})\/enabled$/i.exec(path);
         if (editAgent && method==='POST') return json(res,200,{agent:store.setAgentEnabled(actor,editAgent[1],(await body(req)).enabled)});
+        const artifactPath = /^\/api\/tasks\/([0-9a-z-]{1,80})\/artifacts(?:\/([0-9a-z-]{1,80}))?$/i.exec(path);
+        if (artifactPath) {
+          const [,taskId,artifactId]=artifactPath;
+          if (!artifactId && method==='GET') return json(res,200,{artifacts:store.artifacts.list(actor,taskId)});
+          if (!artifactId && method==='POST') return json(res,201,{artifact:store.artifacts.create(actor,taskId,await body(req))});
+          if (artifactId && ['GET','HEAD'].includes(method)) {
+            const artifact=store.artifacts.get(actor,taskId,artifactId);
+            res.writeHead(200,{...publicSecurity,'Content-Type':'text/plain; charset=utf-8','Content-Length':artifact.bytes,
+              'Content-Disposition':artifactDisposition(artifact)});
+            return res.end(method==='GET'?artifact.text:undefined);
+          }
+        }
         const updateTask = /^\/api\/tasks\/([0-9a-z-]{1,80})$/i.exec(path);
         if (updateTask && method==='PATCH') return json(res,200,{task:store.updateTask(actor,updateTask[1],await body(req))});
         const resolveDecision = /^\/api\/decisions\/([0-9a-z-]{1,80})\/resolve$/i.exec(path);
