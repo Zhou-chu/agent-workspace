@@ -4,7 +4,7 @@
 2. **Execution and reliability**: host queue over authenticated API, terminal acknowledgment/reconciliation, explicit operator-approved checkout policy, adapter capability gate, decisions/artifacts, chain budgets; deterministic tests do not count as real model/host acceptance. No generalized command execution or autonomous offensive workflows.
 3. **Delivery**: test/coverage CI, Sonar scoped config, desktop pull deployment with verified exact commit, persistent data outside releases and loopback default; configure tailnet only with approved network boundary. Verify actual service and separately record genuine adapters, multi-device and remote-host tests.
 
-`server/` owns API and core, `web/` owns static UI, `connector/` integrates only reviewed supported operations, `deploy/` owns desktop CD. Tools and models may vary; ordinary changes use the lowest sufficient test level from Agent.md. No other repo or existing service changes.
+`server/` owns API and core, `frontend/` owns the independently installed, tested and built static UI, `connector/` integrates only reviewed supported operations, `deploy/` owns desktop CD. Tools and models may vary; ordinary changes use the lowest sufficient test level from Agent.md. No other repo or existing service changes.
 
 ## Stage 1 checkpoint
 

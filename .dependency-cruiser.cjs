@@ -1,25 +1,25 @@
 // Imports within one runtime are allowed. Runtime collaboration is via
 // HTTP or documented protocols, not imports into another runtime's internals.
-const runtimes = ['web', 'server', 'connector', 'deploy'];
+const runtimes = {web:'frontend/public',server:'server',connector:'connector',deploy:'deploy'};
 
 module.exports = {
   forbidden: [
-    ...runtimes.map(runtime => ({
+    ...Object.entries(runtimes).map(([runtime, directory]) => ({
       name: `${runtime}-runtime-boundary`,
       severity: 'error',
-      from: { path: `^${runtime}/` },
-      to: { dependencyTypes: ['local'], pathNot: `^${runtime}/` },
+      from: { path: `^${directory}/` },
+      to: { dependencyTypes: ['local'], pathNot: `^${directory}/` },
     })),
     {
       name: 'browser-no-node',
       severity: 'error',
-      from: { path: '^web/' },
+      from: { path: '^frontend/public/' },
       to: { dependencyTypes: ['core'] },
     },
     {
       name: 'no-runtime-packages',
       severity: 'error',
-      from: { path: '^(web|server|connector|deploy)/' },
+      from: { path: '^(frontend/public|server|connector|deploy)/' },
       to: {
         dependencyTypes: ['npm', 'npm-dev', 'npm-optional', 'npm-peer', 'npm-bundled', 'npm-no-pkg', 'npm-unknown'],
       },
