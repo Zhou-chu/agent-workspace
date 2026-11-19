@@ -20,6 +20,7 @@ const staticSecurity={
 const response=(res,status,message)=>res.writeHead(status,{'Content-Type':'text/plain; charset=utf-8','Cache-Control':'no-store'}).end(message);
 const apiPath=path=>path==='/api'||path.startsWith('/api/');
 const wsPath=path=>path==='/ws';
+const apiSegments=/^\/api(?:\/[a-z0-9-]{1,80})*$/i;
 const pathOf=req=>req.url?.startsWith('/')&&!req.url.startsWith('//')?req.url.split('?',1)[0]:null;
 const hop=new Set(['connection','upgrade','keep-alive','proxy-authenticate','proxy-authorization','proxy-connection','te','trailer','transfer-encoding']);
 
@@ -33,11 +34,23 @@ function backendAddress(value) {
   if (!url || url.origin!==value || url.protocol!=='http:' || !['127.0.0.1','[::1]'].includes(url.hostname) || !url.port) {
     throw new Error('AGENTCHAT_BACKEND_ORIGIN must be an explicit loopback HTTP origin and port, e.g. http://127.0.0.1:4319');
   }
-  return {hostname:url.hostname.replace(/^\[|\]$/g,''),port:Number(url.port)};
+  return {hostname:url.hostname==='[::1]'?'::1':'127.0.0.1',port:Number(url.port)};
 }
 
-function forwardHttp(req,res,backend) {
-  const out=request({...backend,method:req.method,path:req.url,headers:endToEnd(req.headers)},upstream=>{
+function apiTarget(raw,path) {
+  // The destination is fixed at startup. Only simple route components and
+  // individually encoded query names/values may enter its request target.
+  if(!apiSegments.test(path)) return null;
+  const segments=path.slice(1).split('/').map(encodeURIComponent);
+  const query=new URLSearchParams(raw.slice(path.length+1));
+  const pairs=Array.from(query,([name,value])=>encodeURIComponent(name)+'='+encodeURIComponent(value));
+  return '/'+segments.join('/')+(pairs.length?'?'+pairs.join('&'):'');
+}
+
+function forwardHttp(req,res,backend,path) {
+  const target=apiTarget(req.url,path);
+  if(target===null) return response(res,400,'Invalid API path');
+  const out=request({...backend,method:req.method,path:target,headers:endToEnd(req.headers)},upstream=>{
     upstream.once('error',()=>res.destroy());
     res.writeHead(upstream.statusCode,endToEnd(upstream.headers));
     upstream.pipe(res);
@@ -54,12 +67,11 @@ function rejectUpgrade(socket,status) {
 }
 
 function forwardUpgrade(req,client,head,backend) {
-  const path=pathOf(req);
   client.on('error',()=>client.destroy());
-  if (!path||!wsPath(path)) return rejectUpgrade(client,404);
+  if (!wsPath(req.url)) return rejectUpgrade(client,404);
   if (req.method!=='GET'||req.headers.upgrade?.toLowerCase()!=='websocket') return rejectUpgrade(client,400);
   const headers={...endToEnd(req.headers),connection:'Upgrade',upgrade:'websocket'};
-  const out=request({...backend,method:'GET',path:req.url,headers});
+  const out=request({...backend,method:'GET',path:'/ws',headers});
   out.setTimeout(10_000,()=>out.destroy());
   out.once('response',res=>{
     res.resume();
@@ -101,7 +113,7 @@ export async function createFrontendServer({backendOrigin,distDir=distDefault}={
   const server=createServer((req,res)=>{
     const path=pathOf(req);
     if (!path) return response(res,400,'Invalid request path');
-    if (apiPath(path)) return forwardHttp(req,res,backend);
+    if (apiPath(path)) return forwardHttp(req,res,backend,path);
     if (!['GET','HEAD'].includes(req.method)) return response(res,405,'Method not allowed');
     if (path==='/healthz') return res.writeHead(200,{'Cache-Control':'no-store'}).end();
     if (wsPath(path)) return response(res,426,'WebSocket upgrade required');

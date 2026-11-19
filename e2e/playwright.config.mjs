@@ -9,9 +9,5 @@ export default defineConfig({
   timeout: 45_000,
   use: {
     browserName: 'chromium',
-    launchOptions: {
-      executablePath: process.env.AGENTCHAT_CHROMIUM || undefined,
-      args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
-    },
   },
 });

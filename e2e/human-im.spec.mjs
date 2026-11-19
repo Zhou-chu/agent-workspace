@@ -1,6 +1,6 @@
-import { expect, test } from '@playwright/test';
+import { chromium, expect, test } from '@playwright/test';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,25 @@ async function reserve() {
   const port = socket.address().port;
   await new Promise((resolve, reject) => socket.close(error => error ? reject(error) : resolve()));
   return port;
+}
+
+async function writeSyntheticVoice(path) {
+  const sampleRate=16_000, samples=16_000, bodySize=samples*2;
+  const wav=Buffer.alloc(44+bodySize);
+  wav.write('RIFF',0);
+  wav.writeUInt32LE(36+bodySize,4);
+  wav.write('WAVEfmt ',8);
+  wav.writeUInt32LE(16,16);
+  wav.writeUInt16LE(1,20);
+  wav.writeUInt16LE(1,22);
+  wav.writeUInt32LE(sampleRate,24);
+  wav.writeUInt32LE(sampleRate*2,28);
+  wav.writeUInt16LE(2,32);
+  wav.writeUInt16LE(16,34);
+  wav.write('data',36);
+  wav.writeUInt32LE(bodySize,40);
+  for(let i=0;i<samples;i++) wav.writeInt16LE(Math.round(4000*Math.sin(2*Math.PI*240*i/sampleRate)),44+i*2);
+  await writeFile(path,wav);
 }
 
 async function launch() {
@@ -44,7 +63,9 @@ async function launch() {
     await expect.poll(async () => Promise.all([backend,origin].map(url=>fetch(url+'/healthz').then(r=>r.status,()=>0)))).toEqual([200,200]);
     expect((await fetch(backend+'/')).status).toBe(404);
     expect((await fetch(origin+'/')).status).toBe(200);
-    return {origin,ownerKey,stop};
+    const voiceSource=join(data,'synthetic-voice.wav');
+    await writeSyntheticVoice(voiceSource);
+    return {origin,ownerKey,voiceSource,stop};
   } catch (error) {
     await stop();
     throw error;
@@ -64,11 +85,33 @@ async function send(page, body) {
   await expect(page.locator('.message .body').getByText(body,{exact:true})).toBeVisible();
 }
 
-test('two human accounts exchange, retract, transfer media and reconnect over live WebSocket', async ({browser}) => {
-  const {origin,ownerKey,stop} = await launch();
-  const aliceContext = await browser.newContext({permissions:['microphone']});
-  const bobContext = await browser.newContext();
+test('two human accounts exchange, retract, transfer media and reconnect over live WebSocket', async () => {
+  const {origin,ownerKey,voiceSource,stop} = await launch();
+  let browser;
   try {
+    browser=await chromium.launch({
+      executablePath:process.env.AGENTCHAT_CHROMIUM||undefined,
+      args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream',
+        '--use-file-for-fake-audio-capture='+voiceSource],
+    });
+    const aliceContext = await browser.newContext({permissions:['microphone']});
+    const bobContext = await browser.newContext();
+    await aliceContext.addInitScript(()=>{
+      const NativeRecorder=globalThis.MediaRecorder;
+      let recorder, nonemptyChunks=0;
+      globalThis.MediaRecorder=class extends NativeRecorder {
+        constructor(...args) {
+          super(...args);
+          recorder=this;
+          nonemptyChunks=0;
+          this.addEventListener('dataavailable',event=>{ if(event.data.size>0) nonemptyChunks++; });
+        }
+      };
+      globalThis.pollEncodedVoiceForTest=()=>{
+        if(recorder?.state==='recording'&&nonemptyChunks<2) recorder.requestData();
+        return nonemptyChunks;
+      };
+    });
     const alice = await aliceContext.newPage();
     const bob = await bobContext.newPage();
     await login(alice,origin,ownerKey);
@@ -119,11 +162,15 @@ test('two human accounts exchange, retract, transfer media and reconnect over li
 
     await alice.getByRole('button',{name:'录制语音',exact:true}).click();
     await expect(alice.getByText('正在录音',{exact:true})).toBeVisible();
+    // A visible recording label can precede the first encoded sample. Two
+    // nonempty chunks from the native recorder mean more than a container header.
+    await expect.poll(()=>alice.evaluate(()=>globalThis.pollEncodedVoiceForTest())).toBeGreaterThanOrEqual(2);
     await alice.getByRole('button',{name:'停止并发送语音',exact:true}).click();
     const voice = bob.locator('audio[aria-label="语音消息"]');
     await expect(voice).toBeVisible();
     await expect.poll(()=>voice.evaluate(el=>el.readyState)).toBeGreaterThan(0);
     expect(await voice.evaluate(async el=>{await el.play();return !el.paused;})).toBe(true);
+    await expect.poll(()=>voice.evaluate(el=>el.currentTime)).toBeGreaterThan(0);
 
     // Force the running browser connection to close; reconnect to the real
     // server throughout. Only the one offline interval is controlled here.
@@ -142,7 +189,6 @@ test('two human accounts exchange, retract, transfer media and reconnect over li
     reconnectAllowed=true;
     await expect(bob.getByText('断线期间的消息',{exact:true})).toBeVisible();
   } finally {
-    await Promise.all([aliceContext.close(),bobContext.close()]);
-    await stop();
+    try { await browser?.close(); } finally { await stop(); }
   }
 });

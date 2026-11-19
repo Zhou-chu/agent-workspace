@@ -48,7 +48,7 @@ test('frontend relays an ordinary WebSocket handshake and backend text frame', a
   backendServer.on('upgrade',(req,socket)=>{
     sockets.add(socket);
     socket.once('close',()=>sockets.delete(socket));
-    assert.equal(req.url,'/ws?client=browser');
+    assert.equal(req.url,'/ws');
     const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');
     socket.write(Buffer.from([129,2,111,107]));
@@ -58,7 +58,7 @@ test('frontend relays an ordinary WebSocket handshake and backend text frame', a
   await buildFrontend(distDir);
   const frontend=await createFrontendServer({ backendOrigin:backend, distDir });
   const address=await listen(t,frontend);
-  const client=new WebSocket(address.replace('http:', 'ws:')+'/ws?client=browser');
+  const client=new WebSocket(address.replace('http:', 'ws:')+'/ws');
   try {
     const [event]=await once(client,'message',{signal:AbortSignal.timeout(3500)});
     assert.equal(event.data,'ok');
@@ -72,4 +72,35 @@ test('frontend relays an ordinary WebSocket handshake and backend text frame', a
 test('startup refuses missing dist or a non-loopback backend origin', async ()=>{
   await assert.rejects(createFrontendServer({backendOrigin:'http://127.0.0.1:4319',distDir:'/does-not-exist-agentchat-dist'}),/frontend build/i);
   await assert.rejects(createFrontendServer({backendOrigin:'http://192.0.2.1:4319'}),/loopback/i);
+});
+
+test('gateway validates API paths, canonically encodes queries and does not forward noncanonical WebSocket paths', async t=>{
+  const received=[];
+  const backendServer=createServer((req,res)=>{
+    received.push(req.url);
+    res.end('received');
+  });
+  backendServer.on('upgrade',(req,socket)=>{ received.push(req.url); socket.destroy(); });
+  const backend=await listen(t,backendServer);
+  const distDir=await mkdtemp(join(tmpdir(),'agentchat-gateway-target-'));
+  t.after(()=>rm(distDir,{force:true,recursive:true}));
+  await buildFrontend(distDir);
+  const address=await listen(t,await createFrontendServer({backendOrigin:backend,distDir}));
+  const query=await fetch(address+'/api/rooms/chat/messages?after=7&label=one%20two&label=three');
+  assert.equal(query.status,200);
+  await query.text();
+  assert.equal((await fetch(address+'/api/room_name')).status,400);
+  const client=new WebSocket(address.replace('http:','ws:')+'/ws?version=1');
+  await once(client,'error',{signal:AbortSignal.timeout(3000)});
+  assert.deepEqual(received,['/api/rooms/chat/messages?after=7&label=one%20two&label=three']);
+});
+
+test('frontend remains available when its approved loopback backend is unavailable', async t=>{
+  const origin=await listen(t,createServer(req=>req.socket.destroy()));
+  const distDir=await mkdtemp(join(tmpdir(),'agentchat-gateway-unavailable-'));
+  t.after(()=>rm(distDir,{force:true,recursive:true}));
+  await buildFrontend(distDir);
+  const address=await listen(t,await createFrontendServer({backendOrigin:origin,distDir}));
+  assert.equal((await fetch(address+'/healthz')).status,200);
+  assert.equal((await fetch(address+'/api/rooms')).status,502);
 });
