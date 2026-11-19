@@ -20,6 +20,13 @@ async function harness(t) {
   const nativeFetch = globalThis.fetch;
   const page = await nativeFetch(origin);
   assert.equal(page.status, 200);
+  for (const [path,type] of [["/app.mjs","text/javascript"],["/styles.css","text/css"]]) {
+    const asset=await nativeFetch(origin+path);
+    assert.equal(asset.status,200);
+    assert.ok(asset.headers.get("content-type").startsWith(type));
+    assert.ok((await asset.text()).length>0);
+  }
+  assert.equal((await nativeFetch(origin+"/package.json")).status,404);
   const dom = new JSDOM(await page.text(), { url: origin, pretendToBeVisual: true });
   t.after(() => dom.window.close());
   let cookie, tick, intercept = null;
@@ -97,7 +104,7 @@ async function harness(t) {
     });
     return [res.status, await res.json()];
   };
-  await import('../web/app.mjs');
+  await import('../frontend/public/app.mjs');
   await element('#login-token');
   async function login(secret = token) {
     field('访问密钥', secret);

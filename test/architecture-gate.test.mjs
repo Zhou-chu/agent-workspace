@@ -28,8 +28,8 @@ function cruiseFixture(t, files) {
 
 test('permits same-runtime modules and Node built-ins outside the browser', t => {
   const result = cruiseFixture(t, {
-    'web/app.mjs': "import './view.mjs';",
-    'web/view.mjs': 'export const view = 1;',
+    'frontend/public/app.mjs': "import './view.mjs';",
+    'frontend/public/view.mjs': 'export const view = 1;',
     'server/index.mjs': "import 'node:sqlite';",
   });
   assert.deepEqual(result, { status: 0, violations: [] });
@@ -37,7 +37,7 @@ test('permits same-runtime modules and Node built-ins outside the browser', t =>
 
 test('blocks cross-runtime edges, browser Node imports, and missing modules', t => {
   const { status, violations } = cruiseFixture(t, {
-    'web/app.mjs': "import '../server/entry.mjs'; import 'node:crypto';",
+    'frontend/public/app.mjs': "import '../../server/entry.mjs'; import 'node:crypto';",
     'server/entry.mjs': "import '../connector/adapter.mjs';",
     'connector/adapter.mjs': "import '../deploy/local.mjs';",
     'deploy/local.mjs': "import './missing.mjs';",

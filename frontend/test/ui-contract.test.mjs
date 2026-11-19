@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createChatPayload, mergeMessages, chooseRoom } from '../web/chat-model.mjs';
+import { createChatPayload, mergeMessages, chooseRoom } from '../public/chat-model.mjs';
 
 test('ordinary text and ordinary replies cannot implicitly wake an agent', () => {
   assert.deepEqual(createChatPayload({ body: ' @agent ?', replyTo: 'old' }, 'id'), {

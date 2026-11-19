@@ -10,7 +10,7 @@ const cookieName = 'workspace_session';
 const cookie = req => (req.headers.cookie??'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1);
 const bearer = req => /^Bearer ([A-Za-z0-9_.~+\/-]{1,512})$/i.exec(req.headers.authorization??'')?.[1];
 const mime = { '.html':'text/html; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.woff2':'font/woff2' };
-const webDefault = fileURLToPath(new URL('../web/', import.meta.url));
+const webDefault = fileURLToPath(new URL('../frontend/public/', import.meta.url));
 const maxBody = 96*1024;
 const matches = (candidate, expected) => typeof candidate==='string' && candidate.length<=512 &&
   timingSafeEqual(Buffer.from(digest(candidate),'hex'),expected);
