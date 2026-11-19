@@ -34,8 +34,28 @@ most one matching binding per target in the message transaction. Explicit task
 references never fall back to room defaults. Removal, disabling or host revocation
 prevents future selection; old receipts remain historical and are never retargeted.
 
-This checkpoint adds no operator API/UI, dispatch, native registration or adapter.
+This checkpoint adds no UI, dispatch, native runtime registration or adapter.
 The existing inbox is unchanged: a `pending` reminder is not proof of a native
 wake, and a route receipt explicitly records `selected_not_dispatched` or
 `blocked_no_binding`. No old reminder is backfilled and Agent-to-Agent execution
 remains blocked pending trusted execution context and shared budget.
+
+### Owner operator API
+
+The four POST actions below use the existing owner authentication and origin
+checks. They do not run code or contact the host. No connector, Agent scope or UI
+receives native session identifiers from these endpoints. Paths are relative to
+`/api/operator/session-bindings/`:
+
+| Action | JSON input | Output |
+| --- | --- | --- |
+| `inspect` | `roomId`, `agentId`, optional `taskId` | `binding`: current record ID and generation, or null |
+| `set` | Scope plus `hostId`, `harness`, `sessionId`, `generation`, `expectedBindingId` | 201, `binding` ID and generation |
+| `retire` | Scope plus `expectedBindingId` | `binding` ID and retired status |
+| `receipt` | `roomId`, `messageId`, `agentId` | Original selection receipt or null |
+
+Use null as `expectedBindingId` only to register an empty scope. A stale or
+repeated write returns 409; inspect the current owner metadata rather than
+automatically writing again. A receipt remains unchanged even after replacement
+or retirement. Inspection describes registration, not a session being online,
+reachable, permitted to execute, or chosen for dispatch.

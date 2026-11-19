@@ -33,8 +33,7 @@ export function openSessionBindings(db,{requireOwner,requireMembership,reject,tx
   const scope=(input,allowed)=>{
     if (!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(k=>!allowed.includes(k)))
       reject(400,'Unrecognized session binding fields');
-    const {roomId,agentId,taskId,expectedBindingId}=input;
-    if (expectedBindingId!==null) safeId(expectedBindingId,'expected binding ID');
+    const {roomId,agentId,taskId}=input;
     return [safeId(roomId,'room ID'),safeId(agentId,'agent ID'),taskId==null?null:safeId(taskId,'task ID')];
   };
   const current=(room,agent,task)=>get(`SELECT * FROM session_bindings
@@ -45,12 +44,38 @@ export function openSessionBindings(db,{requireOwner,requireMembership,reject,tx
   };
   const retireId=id=>run('UPDATE session_bindings SET active=0 WHERE id=?',id);
   const checkPrior=(prior,expected)=>{
+    if (expected!==null) safeId(expected,'expected binding ID');
     if ((prior?.id??null)!==expected) reject(409,'Session binding changed');
   };
-  const fields=['roomId','agentId','taskId','expectedBindingId'];
+  const scopeFields=['roomId','agentId','taskId'];
+  const fields=[...scopeFields,'expectedBindingId'];
+
+  function route(a,room,message,target) {
+    requireOwner(a);
+    requireMembership(a,room);
+    const r=get(`SELECT sr.binding_id,b.generation FROM session_route_receipts sr
+      JOIN reminders r ON r.id=sr.reminder_id JOIN messages m ON m.id=r.message_id
+      LEFT JOIN session_bindings b ON b.id=sr.binding_id
+      WHERE m.room_id=? AND m.author_id=? AND m.id=? AND r.target_id=?`,room,a.id,message,target);
+    if (!r) return null;
+    const status=r.binding_id===null?'blocked_no_binding':'selected_not_dispatched';
+    return {status,bindingId:r.binding_id,generation:r.generation};
+  }
 
   return {
     owner: {
+      inspect(a,input) {
+        requireOwner(a);
+        const [room,agent,task]=scope(input,scopeFields);
+        requireMembership(a,room);
+        const binding=current(room,agent,task);
+        return binding?.owner_id===a.id ? {id:binding.id,generation:binding.generation} : null;
+      },
+      receipt(a,input) {
+        requireOwner(a);
+        const [room,agent]=scope(input,['roomId','agentId','messageId']);
+        return route(a,room,safeId(input.messageId,'message ID'),agent);
+      },
       set(a,input) {
         requireOwner(a);
         const [room,agent,task]=scope(input,[...fields,'hostId','harness','sessionId','generation']);
@@ -93,17 +118,7 @@ export function openSessionBindings(db,{requireOwner,requireMembership,reject,tx
           return {id:prior.id,status:'retired'};
         });
       },
-      route(a,room,message,target) {
-        requireOwner(a);
-        requireMembership(a,room);
-        const r=get(`SELECT sr.binding_id,b.generation FROM session_route_receipts sr
-          JOIN reminders r ON r.id=sr.reminder_id JOIN messages m ON m.id=r.message_id
-          LEFT JOIN session_bindings b ON b.id=sr.binding_id
-          WHERE m.room_id=? AND m.author_id=? AND m.id=? AND r.target_id=?`,room,a.id,message,target);
-        if (!r) return null;
-        const status=r.binding_id===null?'blocked_no_binding':'selected_not_dispatched';
-        return {status,bindingId:r.binding_id,generation:r.generation};
-      },
+      route,
     },
     // Internal hooks run inside the calling workspace's existing transaction.
     freeze(reminder,owner,room,agent,task) {
