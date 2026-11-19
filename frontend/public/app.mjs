@@ -51,11 +51,49 @@ function field(label, input) { return el('label', {}, label, input); }
 function requestId() {
   return globalThis.crypto.randomUUID?.() ?? Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
 }
+function uploadAttachment(path, file, kind, id) {
+  return api(path, {method:'POST',raw:file,headers:{
+    'Content-Type':file.type||'application/octet-stream','X-AgentChat-Media-Kind':kind,
+    'X-AgentChat-File-Name':encodeURIComponent(file.name),'X-AgentChat-Request-Id':id,
+  }});
+}
+let imSocket;
+let imRetry;
+let failures=0;
+function stopRealtime() {
+  clearTimeout(imRetry);
+  const socket=imSocket;
+  imSocket=undefined;
+  failures=0;
+  socket?.close();
+}
+function startRealtime() {
+  if(!state.session?.imRealtime||imSocket||typeof WebSocket!=='function') return;
+  const url=new URL('/ws',document.URL);
+  url.protocol=url.protocol==='https:'?'wss:':'ws:';
+  const socket=imSocket=new WebSocket(url);
+  socket.addEventListener('open',()=>{
+    if(socket!==imSocket) return;
+    failures=0;
+    if(state.page==='chat') state.sync?.();
+  });
+  socket.addEventListener('message',({data})=>{
+    if(socket!==imSocket || state.page!=='chat') return;
+    let event;
+    try { event=JSON.parse(data); } catch { return; }
+    if(event?.type==='room.changed'&&event.roomId===state.roomId) state.sync?.();
+  });
+  socket.addEventListener('close',()=>{
+    if(socket!==imSocket) return;
+    imSocket=undefined;
+    if(state.session?.imRealtime) imRetry=setTimeout(startRealtime,Math.min(3000,200*2**failures++));
+  });
+}
 async function api(path, options = {}) {
   const response = await fetch(path, {
     credentials: 'same-origin', cache: 'no-store', method: options.method ?? 'GET',
-    headers: options.data ? { 'Content-Type': 'application/json', Accept: 'application/json' } : { Accept: 'application/json' },
-    body: options.data ? JSON.stringify(options.data) : undefined,
+    headers: options.headers ?? (options.data ? { 'Content-Type': 'application/json', Accept: 'application/json' } : { Accept: 'application/json' }),
+    body: options.raw ?? (options.data ? JSON.stringify(options.data) : undefined),
   });
   const data = await response.json().catch(() => null);
   if (!response.ok) {
@@ -72,7 +110,10 @@ function humanTime(value) {
   return value != null && !Number.isNaN(date.valueOf()) ? timestamp.format(date) : '';
 }
 function mountLogin(text = '') {
+  stopRealtime();
   state.epoch += 1;
+  state.stopRecording?.();
+  state.stopRecording=undefined;
   state.session = null;
   state.items = [];
   state.rooms = [];
@@ -105,6 +146,7 @@ async function bootstrap() {
     if (!session.user) return mountLogin();
     state.session = session;
     await changePage('chat');
+    startRealtime();
   } catch (error) {
     mountLogin(error.status === 401 ? '' : error.message);
   }
@@ -118,6 +160,7 @@ function frame(page) {
     panel = el('section', { class: 'view' });
     const nav = el('nav', { class: 'nav', 'aria-label': '工作台导航' }, brandMark());
     for (const [id, label] of navigation) {
+      if(state.session.imRealtime && state.session.user.id!=='owner'&&!['chat','settings'].includes(id)) continue;
       const control = iconButton(label, id, () => changePage(id), { class: 'rail-button rail-' + id }, true);
       navControls.set(id, control);
       nav.append(control);
@@ -139,6 +182,8 @@ async function changePage(page) {
   if (!state.session) return;
   state.page = page;
   const active = ++state.epoch;
+  state.stopRecording?.();
+  state.stopRecording=undefined;
   const target = frame(page);
   try {
     if (page === 'chat') await chatPage(target, active);
@@ -200,7 +245,7 @@ async function chatPage(target, epoch) {
       createToggle.setAttribute('aria-expanded', String(!roomCreate.hidden));
       if (!roomCreate.hidden) name.focus();
     }, { class: 'icon-button', 'aria-expanded': 'false' });
-    roomHead.replaceChildren(el('h2', {}, '群聊'), state.session.user.kind === 'human' ? createToggle : null);
+    roomHead.replaceChildren(el('h2', {}, '群聊'), state.session.user.id === 'owner' ? createToggle : null);
     roomCreate.hidden = true;
     roomCreate.replaceChildren(add);
     roomRows.replaceChildren(...state.rooms.map(room => {
@@ -218,6 +263,8 @@ async function chatPage(target, epoch) {
   }
   function openRoom() {
     const marker = ++state.epoch;
+    state.stopRecording?.();
+    state.stopRecording=undefined;
     const room = state.rooms.find(item => item.id === state.roomId);
     const thread = state.thread;
     const roomPath = '/api/rooms/' + encodeURIComponent(state.roomId ?? '');
@@ -298,7 +345,18 @@ async function chatPage(target, epoch) {
       const content = el('div', { class: 'message-content' }, top);
       if (message.replyTo) content.append(el('div', { class: 'muted' }, '回复消息'));
       if (message.mentions?.length) content.append(el('div', { class: 'statuses' }, ...message.mentions.map(id => el('span', { class: 'badge' }, '@' + selectedActorName(id)))));
-      content.append(el('p', { class: 'body' }, message.body));
+      if(message.retractedAt) {
+        content.append(el('p',{class:'muted'},'消息已撤回'));
+        return el('li',{class:'message','data-message':message.id},content);
+      }
+      if(message.body) content.append(el('p', { class: 'body' }, message.body));
+      if(message.attachment) {
+        const {kind,name}=message.attachment;
+        const src=path+'/'+encodeURIComponent(message.id)+'/attachment';
+        if(kind==='image') content.append(el('img',{class:'chat-image',alt:name,src,loading:'lazy'}));
+        if(kind==='file') content.append(el('a',{href:src,download:''},'下载 '+name));
+        if(kind==='voice') content.append(el('audio',{src,controls:'',preload:'metadata','aria-label':'语音消息'}));
+      }
       const actions = el('div', { class: 'row message-actions' }, iconButton('回复', 'reply', () => {
         draft.replyTo = message.replyTo ?? message.id;
         paintReply();
@@ -307,6 +365,13 @@ async function chatPage(target, epoch) {
       if (!thread && !message.replyTo) actions.append(iconButton('查看线程', 'thread', () => {
         state.thread = message; openRoom(); chat.querySelector('h1')?.focus();
       }, { class: 'subtle reply' }, true));
+      if(state.session.imRealtime && message.authorId===state.session.user.id) actions.append(button('撤回',async event=>{
+        const control=event.currentTarget;
+        control.disabled=true;
+        try { await post(path+'/'+encodeURIComponent(message.id)+'/retract',{}); await refresh(true,true); }
+        catch(error) { info.textContent='未能撤回消息：'+error.message; }
+        finally { control.disabled=false; }
+      },{class:'subtle'}));
       content.append(actions);
       return el('li', { class: 'message', 'data-message': message.id }, el('div', { class: 'avatar', 'aria-hidden': 'true' }, Array.from(author.trim())[0] ?? '·'), content);
     }
@@ -341,15 +406,35 @@ async function chatPage(target, epoch) {
       } else if (closeToBottom) feed.scrollTop = feed.scrollHeight;
       else feed.scrollTop = before;
     }
-    async function refresh(explicit = false) {
-      if (marker !== state.epoch || state.pending || (!explicit && state.hasMore)) return;
-      state.pending = true;
+    let syncQueued=false;
+    async function refresh(explicit = false, fromStart = false) {
+      if(marker!==state.epoch) return;
+      if(state.pending) {syncQueued ||= fromStart;return;}
+      if(!explicit && state.hasMore) return;
+      state.pending=true;
       const query = new URLSearchParams({ limit: '60' });
-      if (state.cursor != null) query.set('after', state.cursor);
+      if (!fromStart && state.cursor != null) query.set('after', state.cursor);
       if (thread) query.set('thread', thread.id);
       try {
-        const data = await api(path + '?' + query.toString());
+        let data = await api(path + '?' + query.toString());
         if (marker !== state.epoch) return;
+        if(fromStart) {
+          const limit=state.items.length+60;
+          const loaded=[...data.messages];
+          while(data.hasMore && loaded.length<limit) {
+            query.set('after',data.nextCursor);
+            data=await api(path+'?'+query.toString());
+            if(marker!==state.epoch) return;
+            loaded.push(...data.messages);
+          }
+          const changed=state.hasMore!==Boolean(data.hasMore)||JSON.stringify(loaded)!==JSON.stringify(state.items);
+          state.items=loaded;
+          state.cursor=data.nextCursor;
+          state.hasMore=Boolean(data.hasMore);
+          if(changed) paintFeed();
+          if(info.dataset.error==='refresh') {info.textContent='';delete info.dataset.error;}
+          return;
+        }
         const first = state.cursor == null;
         const changed = first || data.messages.length > 0 || state.hasMore !== Boolean(data.hasMore);
         state.items = mergeMessages(state.items, data.messages);
@@ -362,8 +447,82 @@ async function chatPage(target, epoch) {
         if (error.status === 401) return mountLogin('登录已失效，请重新登录。');
         info.dataset.error = 'refresh';
         info.textContent = `消息未刷新：${error.message}`;
-      } finally { if (marker === state.epoch) state.pending = false; }
+      } finally {
+        if(marker===state.epoch) {
+          state.pending=false;
+          if(syncQueued){syncQueued=false;void refresh(true,true);}
+        }
+      }
     }
+    const mediaStatus=notice('status');
+    let recording;
+    let stream;
+    async function sendMedia(file,kind,attachmentId=requestId()) {
+      const current=()=>marker===state.epoch;
+      if(!file || !current()) return;
+      mediaStatus.textContent='正在发送…';
+      try {
+        await uploadAttachment(roomPath+'/attachments',file,kind,attachmentId);
+        if(current()) mediaStatus.textContent='';
+        await refresh(true,true);
+      } catch(error) {
+        if(current()) mediaStatus.replaceChildren(
+          el('span',{},'未确认附件发送：'+error.message),
+          button('重试附件',()=>sendMedia(file,kind,attachmentId),{class:'subtle'}));
+      }
+    }
+    function mediaPicker(label,kind,accept) {
+      const pick=el('input',{type:'file','aria-label':label,accept,
+        onchange:event=>{
+          const element=event.currentTarget;
+          const file=element.files[0];
+          element.value='';
+          void sendMedia(file,kind);
+        }});
+      return el('label',{class:'media-picker'},label,pick);
+    }
+    const record=button('录制语音',async ()=>{
+      if(recording?.state==='recording') {
+        recording.stop();
+        record.textContent='录制语音';
+        return;
+      }
+      if(!navigator.mediaDevices?.getUserMedia||!globalThis.MediaRecorder?.isTypeSupported('audio/webm')) {
+        mediaStatus.textContent='此浏览器或连接不支持语音录制。';
+        return;
+      }
+      record.disabled=true;
+      try {
+        const acquired=await navigator.mediaDevices.getUserMedia({audio:true});
+        if(marker!==state.epoch) {acquired.getTracks().forEach(track=>track.stop());return;}
+        stream=acquired;
+        const chunks=[];
+        const microphone=new MediaRecorder(stream,{mimeType:'audio/webm'});
+        recording=microphone;
+        const maxDuration=setTimeout(()=>{if(microphone.state==='recording') microphone.stop();},120_000);
+        const release=()=>{clearTimeout(maxDuration);acquired.getTracks().forEach(track=>track.stop());};
+        microphone.addEventListener('dataavailable',({data})=>{if(data.size) chunks.push(data);});
+        microphone.addEventListener('error',()=>{release();if(marker===state.epoch) mediaStatus.textContent='录音未完成。';});
+        microphone.addEventListener('stop',()=>{
+          release();
+          if(marker!==state.epoch) return;
+          record.textContent='录制语音';
+          const voice=new File(chunks,'语音消息.webm',{type:'audio/webm'});
+          if(voice.size) void sendMedia(voice,'voice');
+          else mediaStatus.textContent='录音太短，请重试。';
+        });
+        microphone.start();
+        state.stopRecording=()=>{release();if(microphone.state==='recording') microphone.stop();};
+        record.textContent='停止并发送语音';
+        mediaStatus.textContent='正在录音';
+      } catch(error) {
+        stream?.getTracks().forEach(track=>track.stop());
+        mediaStatus.textContent='无法录音，请检查浏览器麦克风权限。';
+      } finally {record.disabled=false;}
+    },{class:'subtle'});
+    const mediaControls=state.session.imRealtime ? el('div',{class:'media-controls'},
+      mediaPicker('发送图片','image','image/png,image/jpeg,image/webp,image/gif'),
+      mediaPicker('发送文件','file'),record,mediaStatus) : null;
     const form = el('form', { class: 'composer', onkeydown: event => {
       if (!choices.hidden && event.key === 'Escape' && !event.isComposing) {
         event.preventDefault();
@@ -397,7 +556,7 @@ async function chatPage(target, epoch) {
           info.textContent = `未确认发送：${error.message}。保持内容不变重试不会重复创建消息。`;
         }
       } finally { submit.disabled = false; }
-    } }, el('div', { class: 'composer-context' }, reply, selected, choices),
+    } }, el('div', { class: 'composer-context' }, reply, selected, choices), mediaControls,
       el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, toggle, submit)));
     const heading = el('h1', { tabindex: '-1' }, thread ? '线程' : room.name);
     const memberPanel = el('div', { class: 'member-panel', hidden: '' });
@@ -450,6 +609,7 @@ async function chatPage(target, epoch) {
     refresh(true);
     refreshMembers();
     state.tick = () => refresh();
+    state.sync = () => refresh(true,true);
   }
   openRoom();
 }
@@ -800,8 +960,28 @@ function settingsPage(target) {
       try { await post('/api/logout', {}); mountLogin(); }
       catch (error) { info.textContent = error.message; }
     }), info));
+  if(state.session.imRealtime&&state.session.user.id==='owner') {
+    const panel=el('div',{class:'inline-form',hidden:''});
+    const invite=button('添加真人成员',()=>{panel.hidden=!panel.hidden;if(!panel.hidden) name.focus();});
+    const name=el('input',{required:'',maxlength:'80'});
+    const feedback=notice('status');
+    const send=el('button',{type:'submit',class:'primary'},'生成成员密钥');
+    panel.append(el('form',{onsubmit:async event=>{
+      event.preventDefault();
+      send.disabled=true;
+      try {
+        const {token}=await post('/api/humans',{name:name.value});
+        name.value='';
+        feedback.replaceChildren(el('p',{},'仅在此显示，请通过可信渠道交给成员。'),
+          el('code',{'data-testid':'human-invitation',class:'secret'},token),
+          button('隐藏成员密钥',()=>feedback.replaceChildren()));
+      } catch(error) {feedback.textContent=error.message;}
+      finally {send.disabled=false;}
+    }},field('真人显示名称',name),send),feedback);
+    page.append(invite,panel);
+  }
 }
 globalThis.setInterval(() => {
-  if (state.session && state.page === 'chat' && document.visibilityState !== 'hidden') state.tick?.();
+  if (state.session && !state.session.imRealtime && state.page === 'chat' && document.visibilityState !== 'hidden') state.tick?.();
 }, 5000);
 bootstrap();

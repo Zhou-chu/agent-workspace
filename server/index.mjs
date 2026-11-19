@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { digest, openWorkspace, reject } from './workspace.mjs';
 import { artifactDisposition } from './artifacts.mjs';
+import { attachmentService, localImStorage, mediaDisposition } from './im-attachments.mjs';
 
 const cookieName = 'workspace_session';
 const cookie = req => (req.headers.cookie??'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1);
@@ -53,13 +54,17 @@ function validateOwnerToken(token) {
   if (typeof token!=='string' || token.length<32 || token.length>512 || !/^[A-Za-z0-9_.~+\/-]+$/.test(token))
     throw new Error('WORKSPACE_TOKEN must be a strong 32–512 character non-space token');
 }
-export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, secureCookies=false, publicOrigin=null, extension=null }) {
+export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, secureCookies=false, publicOrigin=null, extension=null, imObjects=null, createRealtime=null }) {
   validateOwnerToken(ownerToken);
   const expected = Buffer.from(digest(ownerToken),'hex');
   if (publicOrigin!==null) {
     const parsed=new URL(publicOrigin);
     if (publicOrigin!==parsed.origin || !['http:','https:'].includes(parsed.protocol)) throw new Error('WORKSPACE_PUBLIC_ORIGIN requires a complete HTTP(S) origin without path');
   }
+  const modern = imObjects!==null;
+  if(modern && typeof createRealtime!=='function') throw new Error('Realtime transport required for the IM API');
+  const attachments = modern ? attachmentService({store,objects:imObjects}) : null;
+  let realtime;
   const attempts = new Map();
   const publicSecurity = {
     'X-Content-Type-Options':'nosniff',
@@ -77,11 +82,12 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
     const token = bearer(req);
     if (req.headers.authorization!==undefined)
       return token ? matches(token,expected) ? store.owner : store.authenticateAgent(token) : null;
-    return store.isHumanSession(cookie(req)) ? store.owner : null;
+    return store.authenticateHumanSession(cookie(req));
   };
+  const trustedOrigin = req => publicOrigin??((req.socket.encrypted?'https://':'http://')+req.headers.host);
   const sameOrigin = req => {
     const origin=req.headers.origin;
-    if (req.headers['sec-fetch-site']==='cross-site' || (origin&&origin!==(publicOrigin??((req.socket.encrypted?'https://':'http://')+req.headers.host))))
+    if (req.headers['sec-fetch-site']==='cross-site' || (origin&&origin!==trustedOrigin(req)))
       reject(403,'Cross-origin request rejected');
   };
   const server = createServer(async (req,res) => {
@@ -102,15 +108,16 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
           let row=attempts.get(key);
           if (row && stamp-row.start>=300000) { attempts.delete(key); row=undefined; }
           if (row?.count>=12) reject(429,'Too many login attempts; wait five minutes');
-          if (!matches(input.token,expected)) {
+          const human=matches(input.token,expected) ? store.owner : modern ? store.authenticateHuman(input.token) : null;
+          if (!human) {
             if (attempts.size>=4096) for (const [k,v] of attempts) if (stamp-v.start>=300000) attempts.delete(k);
             if (attempts.size>=4096 && !attempts.has(key)) reject(429,'Too many login attempts');
             attempts.set(key,{start:row?.start??stamp,count:(row?.count??0)+1});
             reject(401,'Invalid workspace token');
           }
           attempts.delete(key);
-          const token=store.createHumanSession();
-          return json(res,200,{user:store.owner,agents:store.listAgents(store.owner)},{'Set-Cookie':cookieValue(token,secureCookies)});
+          const token=store.createHumanSession(human.id);
+          return json(res,200,{user:human,agents:store.listAgents(human)},{'Set-Cookie':cookieValue(token,secureCookies)});
         }
         if (path.startsWith('/api/host/')) {
           const host=store.hosts.authenticate(bearer(req));
@@ -127,8 +134,10 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         const actor=auth(req);
         if (!actor) reject(401,'Authentication required');
         const bindingPath='/api/operator/session-bindings/';
+        if (modern && actor.kind==='human' && actor.id!=='owner' &&
+            !['/api/logout','/api/session','/api/rooms'].includes(path) && !path.startsWith('/api/rooms/')) reject(403,'Human owner required');
         if (method==='POST' && path.startsWith(bindingPath)) {
-          if (actor.kind!=='human') reject(403,'Human owner required');
+          if (actor.kind!=='human'||actor.id!=='owner') reject(403,'Human owner required');
           const operation=path.slice(bindingPath.length);
           const bindings=store.sessionBindings;
           if (operation==='inspect') return json(res,200,{binding:bindings.inspect(actor,await body(req))});
@@ -141,7 +150,8 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
           store.revokeHumanSession(cookie(req));
           return json(res,200,{ok:true},{'Set-Cookie':cookieValue('',secureCookies,true)});
         }
-        if (method==='GET' && path==='/api/session') return json(res,200,{user:actor,agents:store.listAgents(actor)});
+        if (method==='GET' && path==='/api/session') return json(res,200,{user:actor,agents:store.listAgents(actor),...(modern?{imRealtime:true}: {})});
+        if (modern && method==='POST' && path==='/api/humans') return json(res,201,store.provisionHuman(actor,await body(req)));
         if (method==='GET' && path==='/api/agents') return json(res,200,{agents:store.listAgents(actor)});
         if (method==='POST' && path==='/api/agents') return json(res,201,store.createAgent(actor,await body(req)));
         if (method==='POST' && path==='/api/rooms') return json(res,201,{room:store.createRoom(actor,await body(req))});
@@ -169,13 +179,42 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (members && method==='GET') return json(res,200,{members:store.listRoomMembers(actor,members[1])});
         if (members && method==='POST') {
           const input=await body(req);
+          if (modern && Object.hasOwn(input,'humanId')) return json(res,200,store.setRoomHumanMember(actor,members[1],input.humanId,input.member));
           return json(res,200,store.setRoomMember(actor,members[1],input.agentId,input.member));
         }
         const messages = /^\/api\/rooms\/([0-9a-z-]{1,80})\/messages$/i.exec(path);
         if (messages && method==='GET') return json(res,200,store.listMessages(actor,messages[1],{
           after:url.searchParams.get('after'), limit:url.searchParams.get('limit'), thread:url.searchParams.get('thread'), consumer:url.searchParams.get('consumer'),
         }));
-        if (messages && method==='POST') return json(res,201,{message:store.send(actor,messages[1],await body(req))});
+        if (messages && method==='POST') {
+          const message=store.send(actor,messages[1],await body(req));
+          realtime?.notifyRoom(messages[1]);
+          return json(res,201,{message});
+        }
+        const media = /^\/api\/rooms\/([0-9a-z-]{1,80})\/attachments$/i.exec(path);
+        if (modern && media && method==='POST') {
+          if (actor.kind!=='human') reject(403,'Human session required');
+          const message=await attachments.send(actor,media[1],req);
+          realtime.notifyRoom(media[1]);
+          return json(res,201,{message});
+        }
+        const messageAction = /^\/api\/rooms\/([0-9a-z-]{1,80})\/messages\/([0-9a-z-]{1,80})\/(attachment|retract)$/i.exec(path);
+        if (modern && messageAction) {
+          const [,roomId,messageId,operation]=messageAction;
+          if (operation==='retract' && method==='POST') {
+            if (actor.kind!=='human') reject(403,'Human session required');
+            if (Object.keys(await body(req)).length) reject(400,'Unrecognized request fields');
+            const message=await attachments.retract(actor,roomId,messageId);
+            realtime.notifyRoom(roomId);
+            return json(res,200,{message});
+          }
+          if (operation==='attachment' && ['GET','HEAD'].includes(method)) {
+            const {attachment,bytes}=await attachments.get(actor,roomId,messageId);
+            res.writeHead(200,{...publicSecurity,'Content-Type':attachment.mime,'Content-Length':bytes.length,
+              'Content-Disposition':mediaDisposition(attachment)});
+            return res.end(method==='HEAD'?undefined:bytes);
+          }
+        }
         const editAgent = /^\/api\/agents\/([0-9a-z-]{1,80})\/enabled$/i.exec(path);
         if (editAgent && method==='POST') return json(res,200,{agent:store.setAgentEnabled(actor,editAgent[1],(await body(req)).enabled)});
         const artifactPath = /^\/api\/tasks\/([0-9a-z-]{1,80})\/artifacts(?:\/([0-9a-z-]{1,80}))?$/i.exec(path);
@@ -196,6 +235,7 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (resolveDecision && method==='POST') return json(res,200,{decision:store.resolveDecision(actor,resolveDecision[1],await body(req))});
         reject(404,'Route not found');
       }
+      if (!webDir) reject(404,'Route not found');
       if (!['GET','HEAD'].includes(method)) reject(405,'Method not allowed');
       const pathname=decodeURIComponent(path);
       if (pathname.includes('\\')||pathname.includes('\0')||pathname.split('/').some(part=>part==='..'||part==='.'||part.startsWith('.')))
@@ -213,11 +253,19 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
       else res.end();
     }
   });
+  if (modern) {
+    realtime=createRealtime(server,{
+      authenticate:req=>store.authenticateHumanSession(cookie(req)),
+      allowOrigin:req=>req.headers['sec-fetch-site']!=='cross-site'&&req.headers.origin===trustedOrigin(req),
+      canReadRoom:(actor,id)=>store.canReadRoom(actor,id),
+    });
+    server.stopImRealtime=()=>realtime.close();
+  }
   server.requestTimeout=20_000;
   server.headersTimeout=10_000;
   return server;
 }
-export async function main(env=process.env) {
+export async function main(env=process.env,{createRealtime=null}={}) {
   validateOwnerToken(env.WORKSPACE_TOKEN);
   const root = resolve(env.WORKSPACE_DATA_DIR??'data');
   await mkdir(root,{recursive:true,mode:0o700});
@@ -227,9 +275,13 @@ export async function main(env=process.env) {
   if (host!=='127.0.0.1' && host!=='::1') throw new Error('Only loopback binding is supported; use a separately authorized private TLS reverse proxy');
   const publicOrigin=env.WORKSPACE_PUBLIC_ORIGIN??null;
   const server=createWorkspaceServer({store,ownerToken:env.WORKSPACE_TOKEN,
-    secureCookies:env.WORKSPACE_SECURE_COOKIES==='1'||publicOrigin?.startsWith('https://'),publicOrigin});
+    secureCookies:env.WORKSPACE_SECURE_COOKIES==='1'||publicOrigin?.startsWith('https://'),publicOrigin,
+    ...(createRealtime?{webDir:null,imObjects:localImStorage(join(root,'objects')),createRealtime}: {})});
   server.listen(port,host,()=>console.log('Workspace listening on port ' + port));
-  const stop=()=>server.close(()=>{store.close();process.exitCode=0;});
+  const stop=()=>{
+    server.stopImRealtime?.();
+    server.close(()=>{store.close();process.exitCode=0;});
+  };
   process.once('SIGINT',stop);
   process.once('SIGTERM',stop);
   return server;

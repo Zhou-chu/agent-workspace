@@ -224,3 +224,10 @@ summary { cursor: pointer; width: max-content; max-width: 100%; min-height: 42px
 .task-actions .task-secondary { background: transparent; }
 .task-actions .task-cancel { color: var(--muted); background: transparent; border-color: transparent; text-decoration: underline; text-underline-offset: .18em; }
 .task-actions .task-cancel:not(:disabled):hover, .task-actions .task-secondary:not(:disabled):hover { background: var(--hover); }
+
+.media-controls {display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; padding:0 .25rem .25rem;}
+.media-picker {display:inline-flex; align-items:center; position:relative; padding:.3rem .5rem; border:1px solid currentColor; border-radius:.35rem; cursor:pointer;}
+.media-picker:focus-within {outline:2px solid currentColor; outline-offset:2px;}
+.media-picker input {position:absolute; inset:0; width:100%; opacity:0; cursor:pointer;}
+.chat-image {display:block; max-width:min(100%,32rem); max-height:22rem; object-fit:contain; border-radius:.35rem;}
+.message audio {display:block; max-width:100%;}

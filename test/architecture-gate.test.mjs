@@ -66,3 +66,32 @@ test('blocks third-party modules from production runtimes', t => {
   assert.ok(status > 0);
   assert.deepEqual(violations, ['no-runtime-packages']);
 });
+
+test('permits only the exact storage API edge and the exact WebSocket transport dependency', t => {
+  const {status, violations} = cruiseFixture(t, {
+    'server/im-attachments.mjs': "import '../storage/index.mjs'; import 'node:fs';",
+    'storage/index.mjs': 'export const storage = 1;',
+    'server/im-realtime.mjs': "import 'ws';",
+    'node_modules/ws/package.json': '{"main":"index.js"}',
+    'node_modules/ws/index.js': 'module.exports = 1;',
+  });
+  assert.equal(status,0);
+  assert.deepEqual(violations,[]);
+});
+
+test('blocks adjacent imports outside the two exact runtime exceptions', t => {
+  const {status, violations} = cruiseFixture(t, {
+    'server/im-attachments.mjs': "import '../storage/private.mjs';",
+    'server/index.mjs': "import '../storage/index.mjs'; import 'ws';",
+    'storage/index.mjs': 'export const storage = 1;',
+    'storage/private.mjs': "import 'ws'; import '../server/data.mjs';",
+    'server/data.mjs': 'export const data = 1;',
+    'server/im-realtime.mjs': "import 'ws/other.js';",
+    'node_modules/ws/package.json': '{"main":"index.js"}',
+    'node_modules/ws/index.js': 'module.exports = 1;',
+    'node_modules/ws/other.js': 'module.exports = 2;',
+  });
+  assert.ok(status>0);
+  assert.deepEqual(violations.sort(),['im-realtime-npm-boundary','no-runtime-packages','no-runtime-packages',
+    'server-attachments-boundary','server-runtime-boundary','storage-runtime-boundary']);
+});

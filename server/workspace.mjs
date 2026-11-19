@@ -17,6 +17,23 @@ function str(v, name, max, min = 1) {
 }
 const optional = (v, name, max = 80) => v == null ? null : str(v, name, max);
 const bool = v => typeof v === 'boolean' ? Number(v) : reject(400, 'Invalid enabled state');
+const SESSION_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const HUMAN_TOKEN = /^aw_human_[A-Za-z0-9_-]{43}$/;
+const OWNER_ID = 'owner';
+
+function validateAttachment(value) {
+  if (value === null) return null;
+  const {id,name,mime,kind,size,sha256} = value;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id) ||
+      typeof name !== 'string' || !name.trim() || name.length > 255 ||
+      name === '.' || name === '..' || /[\/\\\x00-\x1f\x7f]/.test(name) ||
+      typeof mime !== 'string' || !/^[a-z0-9][a-z0-9._+-]{0,63}\/[a-z0-9][a-z0-9._+-]{0,63}$/.test(mime) ||
+      !['image','file','voice'].includes(kind) || (kind === 'image' && !mime.startsWith('image/')) ||
+      (kind === 'voice' && !mime.startsWith('audio/')) ||
+      !Number.isSafeInteger(size) || size < 1 ||
+      typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) reject(400,'Invalid attachment metadata');
+  return {id,name,mime,kind,size,sha256};
+}
 
 export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
   const db = new DatabaseSync(path);
@@ -43,15 +60,28 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       decision_id TEXT PRIMARY KEY REFERENCES decisions(id), author_id TEXT NOT NULL REFERENCES actors(id),
       request_id TEXT, request_hash TEXT, message_ref TEXT REFERENCES messages(id), UNIQUE(author_id,request_id),
       CHECK ((request_id IS NULL)=(request_hash IS NULL)));
-    CREATE TABLE IF NOT EXISTS human_sessions (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS human_sessions (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, actor_id TEXT REFERENCES actors(id));
+    CREATE TABLE IF NOT EXISTS human_credentials (actor_id TEXT PRIMARY KEY REFERENCES actors(id), hash TEXT UNIQUE NOT NULL);
+    CREATE TABLE IF NOT EXISTS message_attachments (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id), id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+      mime TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('image','file','voice')),
+      size INTEGER NOT NULL CHECK(size>0), sha256 TEXT NOT NULL
+    );
     INSERT OR IGNORE INTO rooms VALUES ('general','General');
   `);
   if (!db.prepare('PRAGMA table_info(tasks)').all().some(col=>col.name==='version')) db.exec('ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+  if (!db.prepare('PRAGMA table_info(human_sessions)').all().some(col=>col.name==='actor_id')) {
+    db.exec('ALTER TABLE human_sessions ADD COLUMN actor_id TEXT REFERENCES actors(id)');
+  }
+  if (!db.prepare('PRAGMA table_info(messages)').all().some(col=>col.name==='retracted_at')) {
+    db.exec('ALTER TABLE messages ADD COLUMN retracted_at TEXT');
+  }
   const get = (q,...args) => db.prepare(q).get(...args);
   const all = (q,...args) => db.prepare(q).all(...args);
   const run = (q,...args) => db.prepare(q).run(...args);
   run("INSERT OR IGNORE INTO actors(id,kind,name) VALUES ('owner','human',?)", ownerName);
   run("INSERT OR IGNORE INTO members VALUES ('general','owner')");
+  run('UPDATE human_sessions SET actor_id=? WHERE actor_id IS NULL',OWNER_ID);
   const getActor = actorId => actor(get('SELECT * FROM actors WHERE id=?',actorId));
   const tx = fn => {
     db.exec('BEGIN IMMEDIATE');
@@ -59,19 +89,29 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     catch (e) { db.exec('ROLLBACK'); throw e; }
   };
   const requireActor = a => {
-    if (!a?.id || !getActor(a.id)?.enabled) reject(403, 'Actor is not enabled');
-    return getActor(a.id);
+    const stored = a?.id && getActor(a.id);
+    if (!stored?.enabled) reject(403, 'Actor is not enabled');
+    return stored;
   };
   const requireOwner = a => {
-    if (requireActor(a).kind !== 'human') reject(403, 'Human owner required');
+    if (requireActor(a).id !== OWNER_ID) reject(403, 'Human owner required');
   };
   const requireMembership = (a,r) => {
     requireActor(a);
     if (!get('SELECT 1 FROM members WHERE room_id=? AND actor_id=?', r, a.id)) reject(404, 'Room not found');
   };
+  const canReadRoom = (a,r) => Boolean(a?.id && getActor(a.id)?.enabled &&
+    get('SELECT 1 FROM members WHERE room_id=? AND actor_id=?',r,a.id));
+  const publicAttachment = r => ({id:r.id,name:r.name,mime:r.mime,kind:r.kind,size:r.size});
+  const attachmentFor = messageId => get('SELECT id,name,mime,kind,size FROM message_attachments WHERE message_id=?',messageId);
   const msg = r => ({id:r.id, roomId:r.room_id, authorId:r.author_id, authorName:r.author_name, authorKind:r.author_kind, body:r.body,
-    mentions:JSON.parse(r.mentions), replyTo:r.reply_to, taskRef:r.task_ref, createdAt:r.created_at});
-  const msgSelect = 'SELECT m.*,a.name author_name,a.kind author_kind FROM messages m JOIN actors a ON a.id=m.author_id';
+    mentions:JSON.parse(r.mentions), replyTo:r.reply_to, taskRef:r.task_ref, createdAt:r.created_at,
+    ...(r.retracted_at ? {retractedAt:r.retracted_at} : r.attachment_id ? {
+      attachment:publicAttachment({id:r.attachment_id,name:r.attachment_name,mime:r.attachment_mime,kind:r.attachment_kind,size:r.attachment_size}),
+    } : {})});
+  const msgSelect = `SELECT m.*,a.name author_name,a.kind author_kind,ma.id attachment_id,ma.name attachment_name,
+    ma.mime attachment_mime,ma.kind attachment_kind,ma.size attachment_size
+    FROM messages m JOIN actors a ON a.id=m.author_id LEFT JOIN message_attachments ma ON ma.message_id=m.id`;
   const getMessage = msgId => get(msgSelect + ' WHERE m.id=?', msgId);
   const task = r => ({id:r.id,roomId:r.room_id,title:r.title,description:r.description,assigneeId:r.assignee_id,status:r.status,createdAt:r.created_at,version:r.version,dependencyIds:all('SELECT dependency_id FROM task_dependencies WHERE task_id=? ORDER BY dependency_id',r.id).map(x=>x.dependency_id)});
   const decisionSelect = 'SELECT d.*,r.message_ref,COALESCE(a.owner_id,a.id) owner_id FROM decisions d JOIN actors a ON a.id=d.author_id LEFT JOIN decision_requests r ON r.decision_id=d.id';
@@ -79,6 +119,9 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     messageRef:r.message_ref,question:r.question,options:JSON.parse(r.options),status:r.status,response:r.response,createdAt:r.created_at});
   const getDecision = decisionId => get(decisionSelect + ' WHERE d.id=?',decisionId);
 
+  const authenticateHumanSession = token => typeof token === 'string' && SESSION_TOKEN.test(token)
+    ? actor(get(`SELECT a.* FROM human_sessions s JOIN actors a ON a.id=s.actor_id
+      WHERE s.hash=? AND s.expires>? AND a.kind='human' AND a.enabled=1`,digest(token),clock())) ?? null : null;
   const hosts=openHosts(db,{clock,requireOwner,tx});
   const bindings=openSessionBindings(db,{requireOwner,requireMembership,reject,tx});
   return {
@@ -88,21 +131,36 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       return typeof token === 'string' && token.length <= 512 && token.startsWith('aw_agent_')
         ? actor(get("SELECT * FROM actors WHERE kind='agent' AND enabled=1 AND token_hash=?", digest(token))) ?? null : null;
     },
-    createHumanSession() {
-      const token = randomBytes(32).toString('base64url');
-      const expires = Date.now() + 8*60*60*1000;
+    provisionHuman(a,input) {
+      requireOwner(a);
+      const name=str(input.name,'name',80).trim(), humanId=id();
+      const token='aw_human_'+randomBytes(32).toString('base64url');
+      return tx(() => {
+        run("INSERT INTO actors(id,kind,name) VALUES (?,'human',?)",humanId,name);
+        run('INSERT INTO human_credentials(actor_id,hash) VALUES (?,?)',humanId,digest(token));
+        run("INSERT INTO members VALUES ('general',?)",humanId);
+        return {human:getActor(humanId),token};
+      });
+    },
+    authenticateHuman(token) {
+      return typeof token === 'string' && HUMAN_TOKEN.test(token) ? actor(get(`SELECT a.* FROM human_credentials c
+        JOIN actors a ON a.id=c.actor_id WHERE a.kind='human' AND a.enabled=1 AND c.hash=?`,digest(token))) ?? null : null;
+    },
+    createHumanSession(humanId=OWNER_ID) {
+      const human=requireActor({id:humanId});
+      if (human.kind!=='human') reject(403,'Human session required');
+      const token=randomBytes(32).toString('base64url');
+      const stamp=clock(), expires=stamp+8*60*60*1000;
       tx(() => {
-        run('DELETE FROM human_sessions WHERE expires <= ?',Date.now());
-        run('INSERT INTO human_sessions VALUES (?,?)',digest(token),expires);
+        run('DELETE FROM human_sessions WHERE expires<=?',stamp);
+        run('INSERT INTO human_sessions(hash,expires,actor_id) VALUES (?,?,?)',digest(token),expires,human.id);
       });
       return token;
     },
-    isHumanSession(token) {
-      return typeof token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(token) &&
-        Boolean(get('SELECT 1 FROM human_sessions WHERE hash=? AND expires>?',digest(token),Date.now()));
-    },
+    authenticateHumanSession,
+    isHumanSession(token) { return authenticateHumanSession(token)!==null; },
     revokeHumanSession(token) {
-      if (typeof token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(token)) run('DELETE FROM human_sessions WHERE hash=?',digest(token));
+      if (typeof token === 'string' && SESSION_TOKEN.test(token)) run('DELETE FROM human_sessions WHERE hash=?',digest(token));
     },
     listAgents(a) {
       const me = requireActor(a);
@@ -166,6 +224,45 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
         return {roomId,agentId,member};
       });
     },
+    setRoomHumanMember(a,roomId,humanId,member) {
+      requireOwner(a);
+      bool(member);
+      return tx(() => {
+        requireMembership(a,roomId);
+        const target=getActor(humanId);
+        if (target?.kind!=='human' || target.id===OWNER_ID) reject(404,'Collaborator not found');
+        if (member) {
+          if (!target.enabled) reject(409,'Disabled collaborators cannot join');
+          run('INSERT OR IGNORE INTO members VALUES (?,?)',roomId,humanId);
+        } else {
+          run('DELETE FROM members WHERE room_id=? AND actor_id=?',roomId,humanId);
+        }
+        return {roomId,humanId,member};
+      });
+    },
+    canReadRoom,
+    requireRoomMember:requireMembership,
+    getMessageAttachment(a,roomId,messageId) {
+      requireMembership(a,roomId);
+      const row=getMessage(messageId);
+      if (!row || row.room_id!==roomId || row.retracted_at) reject(404,'Attachment not found');
+      const attachment=attachmentFor(messageId);
+      if (!attachment) reject(404,'Attachment not found');
+      return publicAttachment(attachment);
+    },
+    retractMessage(a,roomId,messageId) {
+      return tx(() => {
+        requireMembership(a,roomId);
+        const row=getMessage(messageId);
+        if (!row || row.room_id!==roomId) reject(404,'Message not found');
+        if (row.author_id!==a.id) reject(403,'Only the author can retract this message');
+        if (row.retracted_at) return msg(row);
+        run("UPDATE messages SET body='',mentions='[]',retracted_at=? WHERE id=?",now(),messageId);
+        run('DELETE FROM message_attachments WHERE message_id=?',messageId);
+        run("UPDATE reminders SET state='cancelled' WHERE message_id=? AND state IN ('pending','notification')",messageId);
+        return msg(getMessage(messageId));
+      });
+    },
     listMessages(a,roomId,input) {
       requireMembership(a,roomId);
       const thread = optional(input.thread,'thread');
@@ -188,13 +285,17 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       if (consumer && page.length) run(`INSERT INTO chat_consumers VALUES (?,?,?,?,?) ON CONFLICT (actor_id,consumer_id,room_id,thread) DO UPDATE SET cursor=MAX(cursor,excluded.cursor)`,a.id,consumer,roomId,thread??'',Number(nextCursor));
       return {messages:page.map(msg),nextCursor,hasMore:rows.length>limit};
     },
-    send(a,roomId,input) {
-      const clientRequestId = str(input.clientRequestId,'clientRequestId',100), body = str(input.body,'body',20000);
+    send(a,roomId,input,trustedAttachment=null) {
+      const attachment=validateAttachment(trustedAttachment);
+      const clientRequestId = str(input.clientRequestId,'clientRequestId',100);
+      const body = attachment ? str(input.body===undefined ? '' : input.body,'body',20000,0) : str(input.body,'body',20000);
       const replyTo = optional(input.replyTo,'replyTo'), taskRef = optional(input.taskRef,'taskRef');
       const targets = input.mentions ?? [];
       if (!Array.isArray(targets) || targets.length>16) reject(400,'Invalid mentions');
       const mentions = [...new Set(targets.map(v=>str(v,'mention',80)))].sort();
-      const fingerprint = digest(JSON.stringify([roomId,body,mentions,replyTo,taskRef]));
+      const fingerprint = digest(JSON.stringify([roomId,body,mentions,replyTo,taskRef,
+        ...(attachment ? [[attachment.name,attachment.mime,attachment.kind,attachment.size,attachment.sha256]] : []),
+      ]));
       return tx(() => {
         requireMembership(a,roomId);
         const me = getActor(a.id);
@@ -215,11 +316,13 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
         const msgId = id(), stamp = now();
         run('INSERT INTO messages(id,room_id,author_id,request_id,request_hash,body,mentions,reply_to,task_ref,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
           msgId,roomId,a.id,clientRequestId,fingerprint,body,JSON.stringify(mentions),replyTo,taskRef,stamp);
+        if (attachment) run('INSERT INTO message_attachments(message_id,id,name,mime,kind,size,sha256) VALUES (?,?,?,?,?,?,?)',
+          msgId,attachment.id,attachment.name,attachment.mime,attachment.kind,attachment.size,attachment.sha256);
         for (const target of mentions) {
           // An agent message is visible, but its execution may not wake a peer
           // until a connector can provide a trusted causal-chain budget.
           const recipient = getActor(target), reminderId = id();
-          const state = recipient.kind === 'human' ? 'notification' : me.kind === 'human' ? 'pending' : 'blocked_no_execution_context';
+          const state = recipient.kind === 'human' ? 'notification' : me.id === OWNER_ID ? 'pending' : 'blocked_no_execution_context';
           run('INSERT INTO reminders VALUES (?,?,?,?,?)',reminderId,msgId,target,state,stamp);
           if (state==='pending' && recipient.ownerId===me.id) bindings.freeze(reminderId,me.id,roomId,target,taskRef);
         }

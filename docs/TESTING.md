@@ -1,6 +1,6 @@
 # Testing and hosted quality checks
 
-- `npm run check:architecture` checks the static JavaScript module graph once per CI run on Linux. `frontend/public/`, `server/`, `connector/` and `deploy/` may import only their own local modules; their integration uses the existing HTTP and process protocols. Browser modules cannot import Node built-ins, and production runtimes cannot import npm packages. Unresolved imports and cycles fail CI. There is no exception baseline. The gate does not analyze PowerShell/HTML or computed module specifiers. The `test/architecture-gate.test.mjs` fixtures prove the CLI accepts valid edges and exits nonzero on violations.
+- `npm run check:architecture` checks browser, frontend gateway, server, connector, deployment and storage runtime boundaries. Their public interfaces are HTTP/process protocols or the exact storage adapter entry. Node built-ins are not allowed in browser code; only the WebSocket transport may import its exact locked runtime package. Unresolved imports and cycles fail CI.
 - `node --test test/api-session-bindings.test.mjs`: owner-only operator lifecycle, cross-origin denial, stale-write rejection, immutable replay inspection and zero host dispatch.
 
 - `node --test test/core-session-bindings.test.mjs`: exact task/default selection, no implicit or untrusted peer routing, authorization/revocation, exclusive session scope, generation and stale CAS, legacy migration, durable receipt replay. SQLite selection evidence is not native execution.
@@ -14,3 +14,15 @@
 - The desktop deployer uses the exact successful main push run of `ci.yml`; it does not certify Sonar results. Runtime credentials, caches and data directories are outside releases.
 
 On main, the independent coverage reconciliation compares the exact Sonar revision and scanner's LCOV input. Missing or malformed individual metrics do not erase other verified measures; omissions are summarized using fixed metric names and reason codes, never raw response contents. If the analysis identity is not stable, only the verified hosted LCOV fallback is shown. The diagnostic does not override the scanner's quality gate.
+
+真人 IM 首轮（Node 24，两个独立浏览器上下文）：
+
+```sh
+npm ci --ignore-scripts
+npm --prefix frontend run build
+npm --prefix e2e ci --ignore-scripts
+npx --prefix e2e --no-install playwright install --with-deps chromium
+npm --prefix e2e test
+```
+
+浏览器测试启动不同端口的前端、API/WebSocket 服务和临时私有存储。通过网页创建第二个真人账号，不用两个标签页复用 owner 身份；观察真实 WebSocket 帧后验证对端 UI，并实测重连补齐。录音在 Chromium 使用测试音频设备，不代表真机麦克风或实时通话。浏览器下载内容逐字节校验。存储自身另有构建和 Linux/Windows CI。

@@ -1,0 +1,148 @@
+import { expect, test } from '@playwright/test';
+import { spawn } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+
+async function reserve() {
+  const socket = createServer().listen(0, '127.0.0.1');
+  await once(socket, 'listening');
+  const port = socket.address().port;
+  await new Promise((resolve, reject) => socket.close(error => error ? reject(error) : resolve()));
+  return port;
+}
+
+async function launch() {
+  const ownerKey = randomBytes(32).toString('hex');
+  const data = await mkdtemp(join(tmpdir(), 'agentchat-im-'));
+  let backendPort, frontendPort;
+  [backendPort,frontendPort] = await Promise.all([reserve(),reserve()]);
+  const backend = 'http://127.0.0.1:' + backendPort;
+  const origin = 'http://127.0.0.1:' + frontendPort;
+  function start(script, config) {
+    const child = spawn(process.execPath, [script], {cwd:root, env:{...process.env,...config},stdio:['ignore','pipe','pipe']});
+    child.stdout.resume();
+    child.stderr.resume();
+    return {child, closed:once(child,'close')};
+  }
+  const processes = [
+    start('server/api.mjs', {WORKSPACE_DATA_DIR:data, WORKSPACE_TOKEN:ownerKey, WORKSPACE_OWNER_NAME:'Alice', WORKSPACE_PORT:String(backendPort), WORKSPACE_PUBLIC_ORIGIN:origin}),
+    start('frontend/gateway/index.mjs', {AGENTCHAT_FRONTEND_HOST:'127.0.0.1', AGENTCHAT_FRONTEND_PORT:String(frontendPort), AGENTCHAT_BACKEND_ORIGIN:backend}),
+  ];
+  async function stop() {
+    for(const {child} of processes) child.kill();
+    await Promise.all(processes.map(p=>p.closed));
+    await rm(data,{recursive:true,force:true});
+  }
+  try {
+    await expect.poll(async () => Promise.all([backend,origin].map(url=>fetch(url+'/healthz').then(r=>r.status,()=>0)))).toEqual([200,200]);
+    expect((await fetch(backend+'/')).status).toBe(404);
+    expect((await fetch(origin+'/')).status).toBe(200);
+    return {origin,ownerKey,stop};
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+}
+
+async function login(page, origin, key) {
+  await page.goto(origin);
+  await page.getByLabel('访问密钥').fill(key);
+  await page.getByRole('button',{name:'登录',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'General',exact:true})).toBeVisible();
+}
+
+async function send(page, body) {
+  await page.getByLabel('消息正文').fill(body);
+  await page.getByRole('button',{name:'发送',exact:true}).click();
+  await expect(page.locator('.message .body').getByText(body,{exact:true})).toBeVisible();
+}
+
+test('two human accounts exchange, retract, transfer media and reconnect over live WebSocket', async ({browser}) => {
+  const {origin,ownerKey,stop} = await launch();
+  const aliceContext = await browser.newContext({permissions:['microphone']});
+  const bobContext = await browser.newContext();
+  try {
+    const alice = await aliceContext.newPage();
+    const bob = await bobContext.newPage();
+    await login(alice,origin,ownerKey);
+    await alice.getByRole('button',{name:'设置',exact:true}).click();
+    await alice.getByRole('button',{name:'添加真人成员',exact:true}).click();
+    await alice.getByLabel('真人显示名称').fill('Bob');
+    await alice.getByRole('button',{name:'生成成员密钥',exact:true}).click();
+    const bobKey = await alice.getByTestId('human-invitation').textContent();
+    expect(bobKey).toBeTruthy();
+    await alice.getByRole('button',{name:'隐藏成员密钥',exact:true}).click();
+    await alice.getByRole('button',{name:'群聊',exact:true}).click();
+
+    const wsReady = bob.waitForEvent('websocket',{predicate:socket=>new URL(socket.url()).pathname==='/ws'});
+    await login(bob,origin,bobKey);
+    const socket = await wsReady;
+    const who = await bob.request.get(origin+'/api/session');
+    expect((await who.json()).user).toMatchObject({name:'Bob',kind:'human'});
+    expect((await aliceContext.request.get(origin+'/api/session').then(r=>r.json())).user.name).toBe('Alice');
+
+    const frame = socket.waitForEvent('framereceived',{predicate:({payload})=>typeof payload==='string'&&JSON.parse(payload).type==='room.changed'});
+    await send(alice,'第一条实时消息');
+    expect(JSON.parse((await frame).payload)).toEqual({type:'room.changed',roomId:'general'});
+    const aliceMessage = bob.locator('.message').filter({has:bob.getByText('第一条实时消息',{exact:true})});
+    await expect(aliceMessage.getByText('Alice',{exact:true})).toBeVisible();
+    await expect(aliceMessage.getByRole('button',{name:'撤回',exact:true})).toHaveCount(0);
+    await send(bob,'Bob 回复了');
+    await expect(alice.locator('.message').filter({hasText:'Bob 回复了'}).getByText('Bob',{exact:true})).toBeVisible();
+
+    await alice.locator('.message').filter({hasText:'第一条实时消息'}).getByRole('button',{name:'撤回',exact:true}).click();
+    await expect(aliceMessage).toHaveCount(0);
+    await expect(bob.getByText('消息已撤回',{exact:true})).toBeVisible();
+    await bob.reload();
+    await expect(bob.getByText('消息已撤回',{exact:true})).toBeVisible();
+    await expect(bob.getByText('第一条实时消息',{exact:true})).toHaveCount(0);
+
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aSNsAAAAASUVORK5CYII=','base64');
+    await alice.getByLabel('发送图片').setInputFiles({name:'proof.png',mimeType:'image/png',buffer:png});
+    const image = bob.getByRole('img',{name:'proof.png'});
+    await expect(image).toBeVisible();
+    await expect.poll(()=>image.evaluate(img=>img.naturalWidth)).toBeGreaterThan(0);
+    const payload = Buffer.from('agentchat independent IM fixture\n');
+    await alice.getByLabel('发送文件').setInputFiles({name:'proof.txt',mimeType:'text/plain',buffer:payload});
+    const saved = bob.waitForEvent('download');
+    await bob.getByRole('link',{name:'下载 proof.txt'}).click();
+    const download = await saved;
+    expect(download.suggestedFilename()).toBe('proof.txt');
+    expect(await readFile(await download.path())).toEqual(payload);
+
+    await alice.getByRole('button',{name:'录制语音',exact:true}).click();
+    await expect(alice.getByText('正在录音',{exact:true})).toBeVisible();
+    await alice.getByRole('button',{name:'停止并发送语音',exact:true}).click();
+    const voice = bob.locator('audio[aria-label="语音消息"]');
+    await expect(voice).toBeVisible();
+    await expect.poll(()=>voice.evaluate(el=>el.readyState)).toBeGreaterThan(0);
+    expect(await voice.evaluate(async el=>{await el.play();return !el.paused;})).toBe(true);
+
+    // Force the running browser connection to close; reconnect to the real
+    // server throughout. Only the one offline interval is controlled here.
+    let routeSocket, reconnectAllowed = true;
+    await bobContext.routeWebSocket(/\/ws$/, ws=>{
+      if(!reconnectAllowed) { void ws.close(); return; }
+      ws.connectToServer();
+      routeSocket=ws;
+    });
+    await bob.reload();
+    await expect.poll(()=>Boolean(routeSocket)).toBe(true);
+    reconnectAllowed=false;
+    await routeSocket.close();
+    await send(alice,'断线期间的消息');
+    await expect(bob.getByText('断线期间的消息',{exact:true})).toHaveCount(0);
+    reconnectAllowed=true;
+    await expect(bob.getByText('断线期间的消息',{exact:true})).toBeVisible();
+  } finally {
+    await Promise.all([aliceContext.close(),bobContext.close()]);
+    await stop();
+  }
+});
