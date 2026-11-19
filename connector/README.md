@@ -18,6 +18,12 @@ A human can attach `node connector/mcp-chat.mjs` to one already running or manua
 - `WORKSPACE_MCP_AGENT_TOKEN`: a dedicated token for the intended Agent, never the owner or host token. Do not put a token in the command line, source, chat, or checked-in MCP settings.
 - `WORKSPACE_MCP_CONSUMER_ID`: stable, separate identifier for that Harness session and Agent. Use a different ID for concurrent sessions; reusing one intentionally resumes that consumer's cursor.
 
-It offers only `chat_read` (up to 8 messages per explicit call) and `chat_send` (natural-language body with a stable `clientRequestId` and optional structured member mentions/thread reference). A lost send response can be retried with exactly the same ID and payload. Agent-to-Agent @ is recorded as blocked when a trusted execution context is missing; no automatic wake occurs. Ordinary messages and replies do not create implicit wake events. Chat content is not trusted authority and is not pushed to idle sessions. Decision creation is not exposed by this bridge; the HTTP route needs stable request deduplication before a client's safe retry can be claimed.
+The bridge exposes three tools:
+
+- `chat_read`: explicitly read up to eight messages at a time from a room the Agent belongs to.
+- `chat_send`: send a natural-language message, optionally with structured member mentions, a reply reference, or a task reference. Ordinary chat, replies, and plain-text @ do not trigger a wake. Explicit Agent-to-Agent @ without trusted execution context is recorded as blocked.
+- `tasks_request_decision`: explicitly ask the Agent's human owner to choose among two to twelve options. Optional task and message references must belong to the same room, and the referenced task must be assigned to this Agent. This creates an in-app decision, not a chat message, wake, or native Harness approval.
+
+When retrying a lost response for either write tool, reuse the same `clientRequestId` and payload. Room messages are collaborator content, not authority to act. The bridge never pushes them to idle sessions.
 
 The scoped tests exercise a real stdio child and actual loopback HTTP/SQLite. They do **not** certify Codex, Claude Code, DeepSeek Harness, live model coordination, or multi-device operation.

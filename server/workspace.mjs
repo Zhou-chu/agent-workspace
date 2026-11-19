@@ -2,6 +2,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { openHosts } from './hosts.mjs';
 import { openArtifacts } from './artifacts.mjs';
+import { openSessionBindings } from './session-bindings.mjs';
 
 export function reject(status, message) {
   throw Object.assign(new Error(message), { status });
@@ -78,8 +79,10 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     messageRef:r.message_ref,question:r.question,options:JSON.parse(r.options),status:r.status,response:r.response,createdAt:r.created_at});
   const getDecision = decisionId => get(decisionSelect + ' WHERE d.id=?',decisionId);
 
+  const hosts=openHosts(db,{clock,requireOwner,tx});
+  const bindings=openSessionBindings(db,{requireOwner,requireMembership,reject,tx});
   return {
-    owner: getActor('owner'), hosts:openHosts(db,{clock,requireOwner,tx}), health: () => get('SELECT 1'), close: () => db.close(),
+    owner: getActor('owner'), hosts, sessionBindings:bindings.owner, health: () => get('SELECT 1'), close: () => db.close(),
     artifacts:openArtifacts(db,{requireMembership,tx,reject}),
     authenticateAgent(token) {
       return typeof token === 'string' && token.length <= 512 && token.startsWith('aw_agent_')
@@ -120,7 +123,10 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       requireOwner(a);
       return tx(() => {
         if (!run("UPDATE actors SET enabled=? WHERE kind='agent' AND id=? AND owner_id=?",bool(enabled),agentId,a.id).changes) reject(404,'Agent not found');
-        if (!enabled) run("UPDATE reminders SET state='cancelled' WHERE target_id=? AND state='pending'",agentId);
+        if (!enabled) {
+          run("UPDATE reminders SET state='cancelled' WHERE target_id=? AND state='pending'",agentId);
+          bindings.retireAgent(agentId);
+        }
         return getActor(agentId);
       });
     },
@@ -153,6 +159,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
           run('INSERT OR IGNORE INTO members VALUES (?,?)',roomId,agentId);
         } else {
           run('DELETE FROM members WHERE room_id=? AND actor_id=?',roomId,agentId);
+          bindings.retireMember(roomId,agentId);
           run(`UPDATE reminders SET state='cancelled' WHERE target_id=? AND state='pending'
             AND message_id IN (SELECT id FROM messages WHERE room_id=?)`,agentId,roomId);
         }
@@ -190,6 +197,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       const fingerprint = digest(JSON.stringify([roomId,body,mentions,replyTo,taskRef]));
       return tx(() => {
         requireMembership(a,roomId);
+        const me = getActor(a.id);
         const previous = get(msgSelect + ' WHERE author_id=? AND request_id=?',a.id,clientRequestId);
         if (previous) {
           if (previous.request_hash!==fingerprint) reject(409,'Request identifier already used for different input');
@@ -210,9 +218,10 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
         for (const target of mentions) {
           // An agent message is visible, but its execution may not wake a peer
           // until a connector can provide a trusted causal-chain budget.
-          const kind = getActor(target).kind;
-          const state = kind === 'human' ? 'notification' : a.kind === 'human' ? 'pending' : 'blocked_no_execution_context';
-          run('INSERT INTO reminders VALUES (?,?,?,?,?)',id(),msgId,target,state,stamp);
+          const recipient = getActor(target), reminderId = id();
+          const state = recipient.kind === 'human' ? 'notification' : me.kind === 'human' ? 'pending' : 'blocked_no_execution_context';
+          run('INSERT INTO reminders VALUES (?,?,?,?,?)',reminderId,msgId,target,state,stamp);
+          if (state==='pending' && recipient.ownerId===me.id) bindings.freeze(reminderId,me.id,roomId,target,taskRef);
         }
         return msg(getMessage(msgId));
       });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hostStatus, checkStatus, mayRequestCheck, nextCheckRequestId } from '../web/host-model.mjs';
+import { hostStatus, checkStatus, mayRequestCheck, nextCheckRequestId } from '../public/host-model.mjs';
 
 test('device status never conflates registration with verified contact', () => {
   assert.equal(hostStatus('never_seen'), '尚未连接');

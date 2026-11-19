@@ -10,7 +10,7 @@ const cookieName = 'workspace_session';
 const cookie = req => (req.headers.cookie??'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1);
 const bearer = req => /^Bearer ([A-Za-z0-9_.~+\/-]{1,512})$/i.exec(req.headers.authorization??'')?.[1];
 const mime = { '.html':'text/html; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.woff2':'font/woff2' };
-const webDefault = fileURLToPath(new URL('../web/', import.meta.url));
+const webDefault = fileURLToPath(new URL('../frontend/public/', import.meta.url));
 const maxBody = 96*1024;
 const matches = (candidate, expected) => typeof candidate==='string' && candidate.length<=512 &&
   timingSafeEqual(Buffer.from(digest(candidate),'hex'),expected);
@@ -126,6 +126,16 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (extension && await extension({ req,res,method,path,url,json,body,store,actor:auth(req) })) return;
         const actor=auth(req);
         if (!actor) reject(401,'Authentication required');
+        const bindingPath='/api/operator/session-bindings/';
+        if (method==='POST' && path.startsWith(bindingPath)) {
+          if (actor.kind!=='human') reject(403,'Human owner required');
+          const operation=path.slice(bindingPath.length);
+          const bindings=store.sessionBindings;
+          if (operation==='inspect') return json(res,200,{binding:bindings.inspect(actor,await body(req))});
+          if (operation==='set') return json(res,201,{binding:bindings.set(actor,await body(req))});
+          if (operation==='retire') return json(res,200,{binding:bindings.retire(actor,await body(req))});
+          if (operation==='receipt') return json(res,200,{receipt:bindings.receipt(actor,await body(req))});
+        }
         if (method==='POST' && path==='/api/logout') {
           if (actor.kind!=='human') reject(403,'Human session required');
           store.revokeHumanSession(cookie(req));

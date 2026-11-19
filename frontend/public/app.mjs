@@ -95,7 +95,7 @@ function mountLogin(text = '') {
       await bootstrap();
     } catch (error) { info.textContent = error.message; }
     finally { submit.disabled = false; }
-  } }, el('div', { class: 'login-heading' }, brandMark(), el('h1', {}, 'Agent Workspace')), field('访问密钥', input), submit, info);
+  } }, el('div', { class: 'login-heading' }, brandMark(), el('h1', {}, 'AgentChat')), field('访问密钥', input), submit, info);
   root.replaceChildren(el('section', { class: 'login', 'aria-label': '登录' }, form));
   if (text) input.focus();
 }
@@ -154,7 +154,7 @@ async function changePage(page) {
 }
 function pageFrame(container, title, ...actions) {
   const body = el('div', { class: 'page' }, el('header', { class: 'page-head' },
-    el('div', { class: 'page-title' }, el('span', { class: 'overline' }, 'Agent Workspace'), el('h1', {}, title)),
+    el('div', { class: 'page-title' }, el('span', { class: 'overline' }, 'AgentChat'), el('h1', {}, title)),
     actions.length ? el('div', { class: 'row' }, ...actions) : null));
   container.replaceChildren(body);
   return body;
@@ -174,7 +174,7 @@ async function chatPage(target, epoch) {
   const roomHead = el('div', { class: 'room-section-head' });
   const roomCreate = el('div', { class: 'room-create' });
   const rooms = el('aside', { class: 'room-list', 'aria-label': '群聊列表' },
-    el('div', { class: 'workspace-masthead' }, el('span', { class: 'overline' }, '工作台'), el('h2', {}, 'Agent Workspace')),
+    el('div', { class: 'workspace-masthead' }, el('span', { class: 'overline' }, '工作台'), el('h2', {}, 'AgentChat')),
     el('section', { class: 'room-index' }, roomHead, roomCreate, roomRows),
     el('div', { class: 'workspace-account' }, el('div', { class: 'workspace-account-mark', 'aria-hidden': 'true' },
       Array.from(state.session.user.name)[0] ?? '·'), el('span', {}, state.session.user.name)));

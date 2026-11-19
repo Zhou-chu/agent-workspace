@@ -1,4 +1,4 @@
-# Agent Workspace desktop delivery
+# AgentChat desktop delivery
 
 This is a pull deployer for a Windows account that owns the application. The
 GitHub-hosted CI runner has no access to the desktop or its secrets. This
