@@ -1,4 +1,4 @@
-# Agent Workspace
+# AgentChat
 
 群聊式开发工作台。代码仓库公开，运行实例默认只监听本机，不开放公网。
 

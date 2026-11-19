@@ -126,6 +126,16 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (extension && await extension({ req,res,method,path,url,json,body,store,actor:auth(req) })) return;
         const actor=auth(req);
         if (!actor) reject(401,'Authentication required');
+        const bindingPath='/api/operator/session-bindings/';
+        if (method==='POST' && path.startsWith(bindingPath)) {
+          if (actor.kind!=='human') reject(403,'Human owner required');
+          const operation=path.slice(bindingPath.length);
+          const bindings=store.sessionBindings;
+          if (operation==='inspect') return json(res,200,{binding:bindings.inspect(actor,await body(req))});
+          if (operation==='set') return json(res,201,{binding:bindings.set(actor,await body(req))});
+          if (operation==='retire') return json(res,200,{binding:bindings.retire(actor,await body(req))});
+          if (operation==='receipt') return json(res,200,{receipt:bindings.receipt(actor,await body(req))});
+        }
         if (method==='POST' && path==='/api/logout') {
           if (actor.kind!=='human') reject(403,'Human session required');
           store.revokeHumanSession(cookie(req));

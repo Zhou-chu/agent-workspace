@@ -106,6 +106,7 @@ async function harness(t) {
   };
   await import('../frontend/public/app.mjs');
   await element('#login-token');
+  assert.equal(dom.window.document.querySelector('.login-heading h1').textContent,'AgentChat');
   async function login(secret = token) {
     field('访问密钥', secret);
     submit('.login form');

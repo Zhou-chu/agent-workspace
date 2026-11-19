@@ -17,5 +17,6 @@ test('build emits exactly the same assets as the application serves', async t=>{
   }
   const html=await readFile(join(out,'index.html'),'utf8');
   assert.match(html,/<link rel="stylesheet" href="\/styles\.css">/);
+  assert.match(html, /<title>AgentChat<\/title>/);
   assert.match(html,/<script type="module" src="\/app\.mjs"><\/script>/);
 });
