@@ -1,4 +1,4 @@
-import { chooseRoom, createChatPayload, mergeMessages } from './chat-model.mjs';
+import { chooseRoom, collectRoomPages, contactAction, createChatPayload, mergeMessages, visibleReadCursor } from './chat-model.mjs';
 import { hostStatus, checkStatus, mayRequestCheck, nextCheckRequestId } from './host-model.mjs';
 import { icon } from './icons.mjs';
 
@@ -75,13 +75,18 @@ function startRealtime() {
   socket.addEventListener('open',()=>{
     if(socket!==imSocket) return;
     failures=0;
-    if(state.page==='chat') state.sync?.();
+    if(state.page==='chat') state.reconcile?.();
   });
   socket.addEventListener('message',({data})=>{
     if(socket!==imSocket || state.page!=='chat') return;
     let event;
     try { event=JSON.parse(data); } catch { return; }
-    if(event?.type==='room.changed'&&event.roomId===state.roomId) state.sync?.();
+    if(event?.type==='room.changed'&&typeof event.roomId==='string') {
+      state.refreshRooms?.();
+      if(event.roomId===state.roomId) state.sync?.();
+    }
+    if(event?.type==='read.changed') state.refreshRooms?.();
+    if(event?.type==='contacts.changed') state.refreshContacts?.();
   });
   socket.addEventListener('close',()=>{
     if(socket!==imSocket) return;
@@ -115,6 +120,7 @@ function mountLogin(text = '') {
   state.stopRecording?.();
   state.stopRecording=undefined;
   state.session = null;
+  state.reconcile = state.refreshRooms = state.refreshContacts = state.sync = state.tick = undefined;
   state.items = [];
   state.rooms = [];
   state.roomId = null;
@@ -184,6 +190,7 @@ async function changePage(page) {
   const active = ++state.epoch;
   state.stopRecording?.();
   state.stopRecording=undefined;
+  state.reconcile = state.refreshRooms = state.refreshContacts = state.sync = state.tick = undefined;
   const target = frame(page);
   try {
     if (page === 'chat') await chatPage(target, active);
@@ -210,6 +217,98 @@ function listRows(items, child, empty) {
 function stateLabel(status) {
   return ({ open: '待处理', pending: '待处理', resolved: '已处理', in_progress: '处理中', review_requested: '待验收', accepted: '已验收', queued: '已排队', planned: '已登记', running: '运行中', completed: '已完成', cancelled: '已取消', offline: '离线', online: '在线', blocked: '受阻', expired: '已失效', idle: '空闲', failed: '失败' })[status] ?? status ?? '未知';
 }
+function contactsPanel(active, openDirect) {
+  const panel = el('section', {id:'chat-contacts', class:'contact-panel', 'aria-label':'联系人', hidden:''});
+  const info = notice('status');
+  const lists = el('div', {class:'contact-sections'});
+  const results = el('div', {class:'contact-sections'});
+  const query = el('input',{type:'search',maxlength:'80',required:''});
+  const submit = el('button',{type:'submit',class:'subtle'},'搜索');
+  let serial = 0;
+  let contacts = {friends:[],incoming:[],outgoing:[]};
+  let search;
+  let pending = false;
+  let refreshPending = false, refreshQueued = false;
+  const opened = () => active() && !panel.hidden;
+  const report = error => {if(opened()) info.textContent=error.message;};
+  const restoreAction = (container, render) => {
+    const focused = container.contains(document.activeElement) ? document.activeElement : null;
+    const id = focused?.dataset.contact;
+    render();
+    if(id) [...container.querySelectorAll('button')].find(node=>node.dataset.contact===id)?.focus({preventScroll:true});
+  };
+  function item(person, status) {
+    const action = contactAction(status);
+    return el('div',{class:'contact-item'},el('span',{},person.name),
+      action ? button(action.label, async event=>{
+        if(pending) return;
+        pending=true;
+        const control=event.currentTarget;
+        control.disabled=true;
+        info.textContent='';
+        try {
+          const response=await post(action.path,{humanId:person.id});
+          if(!opened()) return;
+          if(response.room) {openDirect(response.room);return;}
+          info.textContent=status==='incoming'?'已接受好友申请。':'已发出好友申请。';
+          await refresh();
+        } catch(error) {report(error);}
+        finally {pending=false;control.disabled=false;}
+      },{class:'subtle','data-contact':person.id}) :
+      status==='outgoing' ? el('span',{class:'muted'},'等待确认') : null);
+  }
+  function panelGroup(title, people, status, empty) {
+    return el('section',{},el('h3',{},title),listRows(people,person=>item(person,status??person.status),empty));
+  }
+  function paintContacts() {
+    restoreAction(lists,()=>lists.replaceChildren(
+      panelGroup('收到的申请',contacts.incoming,'incoming','暂无申请'),
+      panelGroup('发出的申请',contacts.outgoing,'outgoing','暂无申请'),
+      panelGroup('好友',contacts.friends,'friend','暂无好友')));
+  }
+  async function searchPeople(value) {
+    const attempt=++serial;
+    try {
+      const {people}=await api('/api/contacts/search?'+new URLSearchParams({q:value}));
+      if(attempt!==serial||!opened()) return;
+      restoreAction(results,()=>results.replaceChildren(panelGroup('搜索结果',people,null,'未找到用户')));
+    } catch(error) {if(attempt===serial) report(error);}
+  }
+  async function refresh() {
+    if(!opened()) return;
+    if(refreshPending){refreshQueued=true;return;}
+    refreshPending=true;
+    try {
+      const next=await api('/api/contacts');
+      if(!opened()) return;
+      if(JSON.stringify(next)!==JSON.stringify(contacts)||!lists.childElementCount) {contacts=next;paintContacts();}
+      if(search) await searchPeople(search);
+    } catch(error) {report(error);}
+    finally {
+      refreshPending=false;
+      if(refreshQueued){refreshQueued=false;void refresh();}
+    }
+  }
+  const toggle = iconButton('联系人','people',()=>{
+    panel.hidden=!panel.hidden;
+    toggle.setAttribute('aria-expanded',String(!panel.hidden));
+    if(opened()){query.focus();void refresh();}
+  },{class:'icon-button','aria-expanded':'false','aria-controls':panel.id});
+  function close() {panel.hidden=true;toggle.setAttribute('aria-expanded','false');serial++;}
+  panel.addEventListener('keydown',event=>{
+    if(event.key==='Escape'){event.stopPropagation();close();toggle.focus();}
+  });
+  panel.append(el('form',{class:'contact-search',onsubmit:async event=>{
+    event.preventDefault();
+    search=query.value.trim();
+    if(!search) return;
+    info.textContent='';
+    submit.disabled=true;
+    try {await searchPeople(search);} finally {submit.disabled=false;}
+  }},field('搜索用户',query),submit),info,results,lists);
+  return {toggle,panel,refresh,close};
+}
+
 async function chatPage(target, epoch) {
   const loaded = await api('/api/rooms');
   if (epoch !== state.epoch) return;
@@ -218,14 +317,69 @@ async function chatPage(target, epoch) {
   const roomRows = el('div', { class: 'room-rows' });
   const roomHead = el('div', { class: 'room-section-head' });
   const roomCreate = el('div', { class: 'room-create' });
-  const rooms = el('aside', { class: 'room-list', 'aria-label': '群聊列表' },
+  const modern = state.session.imRealtime === true;
+  const contacts = modern && state.session.user.kind==='human'
+    ? contactsPanel(()=>chat.isConnected && state.page==='chat',room=>{
+      if(!state.rooms.some(item=>item.id===room.id)) state.rooms.push(room);
+      contacts.close();
+      selectRoom(room.id);
+      void refreshRooms();
+    }) : null;
+  const rooms = el('aside', { class: 'room-list', 'aria-label': modern ? '会话列表' : '群聊列表' },
     el('div', { class: 'workspace-masthead' }, el('span', { class: 'overline' }, '工作台'), el('h2', {}, 'AgentChat')),
-    el('section', { class: 'room-index' }, roomHead, roomCreate, roomRows),
+    el('section', { class: 'room-index' }, roomHead, roomCreate, contacts?.panel, roomRows),
     el('div', { class: 'workspace-account' }, el('div', { class: 'workspace-account-mark', 'aria-hidden': 'true' },
       Array.from(state.session.user.name)[0] ?? '·'), el('span', {}, state.session.user.name)));
   const chat = el('div', { class: 'chat' }, rooms);
   target.replaceChildren(chat);
-  function roomList() {
+  function selectRoom(id) {
+    state.roomId = id;
+    state.thread = null;
+    state.mobile = true;
+    storage.set('workspace.room',id);
+    openRoom();
+    chat.querySelector('h1')?.focus();
+  }
+  const activeChat = () => chat.isConnected && state.page==='chat';
+  function paintRooms() {
+    const focused = roomRows.contains(document.activeElement) ? document.activeElement.dataset.room : null;
+    roomRows.replaceChildren(...state.rooms.map((room,index) => {
+      const unread = Number.isSafeInteger(room.unread) && room.unread>0 ? room.unread : 0;
+      const badgeId = 'chat-unread-'+index;
+      const name = room.peer?.name ?? room.name;
+      const control = iconButton(name, room.kind==='direct'?'chat':'hash', () => selectRoom(room.id), {
+        class:'room', 'data-room':room.id, 'aria-current':room.id===state.roomId?'true':null,
+        'aria-describedby':unread?badgeId:null,
+      }, true);
+      if(unread) control.append(el('span',{class:'room-unread','data-unread':unread, 'aria-hidden':'true'},unread>99?'99+':String(unread)));
+      return el('div',{},control,unread?el('span',{id:badgeId,hidden:''},unread+' 条未读消息'):null);
+    }));
+    if(focused) [...roomRows.querySelectorAll('button')].find(control=>control.dataset.room===focused)?.focus({preventScroll:true});
+    if (!state.rooms.length) roomRows.append(el('p', { class: 'empty' }, modern?'暂无会话。':'此账户没有可访问的群聊。'));
+  }
+  let loadingRooms=false, roomRefreshQueued=false;
+  async function refreshRooms() {
+    if(!activeChat()||!modern) return;
+    if(loadingRooms){roomRefreshQueued=true;return;}
+    loadingRooms=true;
+    try {
+      const {rooms:next}=await api('/api/rooms');
+      if(!activeChat()||roomRefreshQueued) return;
+      if(JSON.stringify(next)===JSON.stringify(state.rooms)) return;
+      state.rooms=next;
+      if(!next.some(room=>room.id===state.roomId)) {
+        state.roomId=chooseRoom(next,null);
+        state.thread=null;
+        openRoom();
+      } else paintRooms();
+    } catch(error) {
+      if(activeChat()&&error.status===401) mountLogin('登录已失效，请重新登录。');
+    } finally {
+      loadingRooms=false;
+      if(roomRefreshQueued){roomRefreshQueued=false;void refreshRooms();}
+    }
+  }
+  function setRoomControls() {
     const name = el('input', { required: '', maxlength: '80' });
     const info = notice('alert');
     const submit = el('button', { type: 'submit', class: 'primary' }, '创建');
@@ -235,8 +389,10 @@ async function chatPage(target, epoch) {
         const { room } = await post('/api/rooms', { name: name.value.trim() });
         if (!chat.isConnected) return;
         state.rooms.push(room);
-        state.roomId = room.id; state.thread = null; state.mobile = true;
-        storage.set('workspace.room', room.id); openRoom();
+        roomCreate.hidden=true;
+        createToggle.setAttribute('aria-expanded','false');
+        selectRoom(room.id);
+        void refreshRooms();
       } catch (error) { info.textContent = error.message; }
       finally { submit.disabled = false; }
     } }, field('群聊名称', name), submit, info);
@@ -245,28 +401,22 @@ async function chatPage(target, epoch) {
       createToggle.setAttribute('aria-expanded', String(!roomCreate.hidden));
       if (!roomCreate.hidden) name.focus();
     }, { class: 'icon-button', 'aria-expanded': 'false' });
-    roomHead.replaceChildren(el('h2', {}, '群聊'), state.session.user.id === 'owner' ? createToggle : null);
+    roomHead.replaceChildren(el('h2', {}, modern?'会话':'群聊'), el('div',{class:'row room-actions'},
+      contacts?.toggle, state.session.user.id === 'owner' ? createToggle : null));
     roomCreate.hidden = true;
     roomCreate.replaceChildren(add);
-    roomRows.replaceChildren(...state.rooms.map(room => {
-      const control = iconButton(room.name, 'hash', () => {
-        state.roomId = room.id;
-        state.thread = null;
-        state.mobile = true;
-        storage.set('workspace.room', room.id);
-        openRoom();
-        chat.querySelector('h1')?.focus();
-      }, { class: 'room', 'aria-current': room.id === state.roomId ? 'true' : null }, true);
-      return control;
-    }));
-    if (!state.rooms.length) roomRows.append(el('p', { class: 'empty' }, '此账户没有可访问的群聊。'));
   }
+  setRoomControls();
+  state.refreshRooms=refreshRooms;
+  state.refreshContacts=contacts?.refresh;
+  state.reconcile=()=>{void refreshRooms();void contacts?.refresh();state.sync?.();};
   function openRoom() {
     const marker = ++state.epoch;
     state.stopRecording?.();
     state.stopRecording=undefined;
     const room = state.rooms.find(item => item.id === state.roomId);
     const thread = state.thread;
+    const direct = room?.kind==='direct';
     const roomPath = '/api/rooms/' + encodeURIComponent(state.roomId ?? '');
     const path = roomPath + '/messages';
     const viewKey = roomPath + '/' + (thread?.id ?? '');
@@ -278,11 +428,13 @@ async function chatPage(target, epoch) {
     state.hasMore = false;
     state.pending = false;
     chat.dataset.mobile = state.mobile ? 'conversation' : 'rooms';
-    roomList();
+    paintRooms();
+    state.tick=state.sync=undefined;
     chat.querySelector('.conversation')?.remove();
     if (!room) return;
     const info = notice('status');
-    const feed = el('ol', { class: 'feed', 'aria-label': '群聊消息', tabindex: '0', onscroll: () => {
+    const feed = el('ol', { class: 'feed', 'aria-label': direct?'私聊消息':'群聊消息', tabindex: '0', onscroll: () => {
+      acknowledgeRead();
       if (!restoreScroll) {
         if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 16) feedPositions.delete(viewKey);
         else feedPositions.set(viewKey, feed.scrollTop);
@@ -394,7 +546,7 @@ async function chatPage(target, epoch) {
       if (!state.items.length) feed.append(el('li', { class: 'chat-empty' },
         el('div', { class: 'empty-icon', 'aria-hidden': 'true' }, icon(thread ? 'thread' : 'hash')),
         el('h2', {}, thread ? '还没有回复' : '这里还没有消息'),
-        el('p', {}, thread ? '写一条回复，继续当前讨论。' : '写一条消息开始协作。需要对方接手时，再选中 @ 成员。')));
+        el('p', {}, thread ? '写一条回复，继续当前讨论。' : direct ? '写一条消息开始私聊。' : '写一条消息开始协作。需要对方接手时，再选中 @ 成员。')));
       if (state.hasMore) feed.append(el('li', { class: 'load-more' }, button('加载更多消息', () => refresh(true))));
       if (focusedMessage && focusedAction) {
         const replacement = [...feed.querySelectorAll('[data-message]')].find(node => node.dataset.message === focusedMessage);
@@ -407,15 +559,59 @@ async function chatPage(target, epoch) {
       else feed.scrollTop = before;
     }
     let syncQueued=false;
+    let appendQueued=false;
+    let renderedCursor=null, renderedCount=0, acknowledged=null, reading=false;
+    function acknowledgeRead() {
+      const cursor=visibleReadCursor({
+        active:modern&&marker===state.epoch&&feed.isConnected,
+        focused:document.hasFocus(), visible:document.visibilityState==='visible',
+        conversationVisible:state.mobile||!document.defaultView?.matchMedia?.('(max-width: 760px)').matches,
+        atBottom:feed.scrollHeight-feed.scrollTop-feed.clientHeight<16,
+        thread, cursor:renderedCursor, rendered:renderedCount,
+      });
+      if(!cursor||reading||cursor===acknowledged) return;
+      reading=true;
+      post(roomPath+'/read',{cursor}).then(()=>{
+        acknowledged=cursor;
+        void refreshRooms();
+      }).catch(error=>{
+        if(marker===state.epoch&&error.status===401) mountLogin('登录已失效，请重新登录。');
+      }).finally(()=>{
+        reading=false;
+        if(acknowledged===cursor&&renderedCursor!==cursor&&marker===state.epoch) acknowledgeRead();
+      });
+    }
+    function markRendered() {
+      renderedCursor=state.cursor;
+      renderedCount=state.items.length;
+      acknowledgeRead();
+    }
     async function refresh(explicit = false, fromStart = false) {
       if(marker!==state.epoch) return;
-      if(state.pending) {syncQueued ||= fromStart;return;}
+      if(state.pending) {syncQueued ||= fromStart;appendQueued ||= !fromStart&&modern;return;}
       if(!explicit && state.hasMore) return;
       state.pending=true;
       const query = new URLSearchParams({ limit: '60' });
       if (!fromStart && state.cursor != null) query.set('after', state.cursor);
       if (thread) query.set('thread', thread.id);
       try {
+        // Phase 1 automatically catches up private conversations. Group and
+        // thread history retain their explicit bounded paging behavior.
+        if(modern&&direct&&!thread) {
+          const batch=await collectRoomPages(cursor=>{
+            if(cursor!=null) query.set('after',cursor); else query.delete('after');
+            return api(path+'?'+query.toString());
+          },fromStart?null:state.cursor,fromStart?[]:state.items,()=>marker===state.epoch);
+          if(!batch||marker!==state.epoch) return;
+          const changed=renderedCursor===null||JSON.stringify(batch.messages)!==JSON.stringify(state.items);
+          state.items=batch.messages;
+          state.cursor=batch.nextCursor;
+          state.hasMore=false;
+          if(changed) paintFeed();
+          markRendered();
+          if(explicit||info.dataset.error==='refresh'){info.textContent='';delete info.dataset.error;}
+          return;
+        }
         let data = await api(path + '?' + query.toString());
         if (marker !== state.epoch) return;
         if(fromStart) {
@@ -432,6 +628,7 @@ async function chatPage(target, epoch) {
           state.cursor=data.nextCursor;
           state.hasMore=Boolean(data.hasMore);
           if(changed) paintFeed();
+          markRendered();
           if(info.dataset.error==='refresh') {info.textContent='';delete info.dataset.error;}
           return;
         }
@@ -441,6 +638,7 @@ async function chatPage(target, epoch) {
         state.cursor = data.nextCursor ?? state.cursor;
         state.hasMore = Boolean(data.hasMore);
         if (changed) paintFeed();
+        markRendered();
         if (explicit || info.dataset.error === 'refresh') { info.textContent = ''; delete info.dataset.error; }
       } catch (error) {
         if (marker !== state.epoch) return;
@@ -450,7 +648,7 @@ async function chatPage(target, epoch) {
       } finally {
         if(marker===state.epoch) {
           state.pending=false;
-          if(syncQueued){syncQueued=false;void refresh(true,true);}
+          if(syncQueued||appendQueued){const restart=syncQueued;syncQueued=appendQueued=false;void refresh(true,restart);}
         }
       }
     }
@@ -557,7 +755,7 @@ async function chatPage(target, epoch) {
         }
       } finally { submit.disabled = false; }
     } }, el('div', { class: 'composer-context' }, reply, selected, choices), mediaControls,
-      el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, toggle, submit)));
+      el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, direct?null:toggle, submit)));
     const heading = el('h1', { tabindex: '-1' }, thread ? '线程' : room.name);
     const memberPanel = el('div', { class: 'member-panel', hidden: '' });
     async function refreshMembers() {
@@ -592,24 +790,24 @@ async function chatPage(target, epoch) {
       memberButton.setAttribute('aria-expanded', String(!memberPanel.hidden));
       if (!memberPanel.hidden) refreshMembers();
     }, { class: 'icon-button', 'aria-expanded': 'false' });
-    const back = iconButton('返回群聊列表', 'arrow', () => { state.mobile = false; chat.dataset.mobile = 'rooms'; rooms.querySelector('[aria-current]')?.focus(); }, { class: 'mobile-back icon-button' });
+    const back = iconButton(modern?'返回会话列表':'返回群聊列表', 'arrow', () => { state.mobile = false; chat.dataset.mobile = 'rooms'; rooms.querySelector('[aria-current]')?.focus(); }, { class: 'mobile-back icon-button' });
     const threadBack = thread ? iconButton('返回群聊', 'arrow', () => {
       state.thread = null; openRoom(); chat.querySelector('h1')?.focus();
     }, { class: 'icon-button' }) : null;
     const headingBox = el('div', { class: 'conversation-title' },
       thread ? el('span', { class: 'overline' }, room.name) : null,
-      el('div', { class: 'conversation-heading' }, icon(thread ? 'thread' : 'hash'), heading));
+      el('div', { class: 'conversation-heading' }, icon(thread ? 'thread' : direct?'chat':'hash'), heading));
     const bar = el('header', { class: 'conversation-bar' },
       el('div', { class: 'conversation-bar-inner' }, back, threadBack, headingBox,
-        el('div', { class: 'header-actions' }, memberButton, iconButton('刷新', 'refresh', () => refresh(true), { class: 'icon-button' }))));
+        el('div', { class: 'header-actions' }, direct?null:memberButton, iconButton('刷新', 'refresh', () => refresh(true), { class: 'icon-button' }))));
     const conversation = el('article', { class: 'conversation' }, bar,
       el('div', { class: 'conversation-context' }, info, memberPanel), feed, el('div', { class: 'composer-dock' }, form));
     chat.append(conversation);
     paintMentions(); paintReply();
     refresh(true);
-    refreshMembers();
+    if(!direct) refreshMembers();
     state.tick = () => refresh();
-    state.sync = () => refresh(true,true);
+    state.sync = () => {acknowledgeRead();return refresh(true,true);};
   }
   openRoom();
 }
@@ -984,4 +1182,9 @@ function settingsPage(target) {
 globalThis.setInterval(() => {
   if (state.session && !state.session.imRealtime && state.page === 'chat' && document.visibilityState !== 'hidden') state.tick?.();
 }, 5000);
+function returnToChat() {
+  if(state.page==='chat' && document.visibilityState==='visible' && document.hasFocus()) state.reconcile?.();
+}
+document.addEventListener('visibilitychange',returnToChat);
+document.defaultView?.addEventListener('focus',returnToChat);
 bootstrap();

@@ -59,20 +59,29 @@ export function createImRealtime(server,{authenticate,allowOrigin,canReadRoom}){
   },heartbeatMs);
   heartbeat.unref();
 
+  function notify(event, allows){
+    const data=JSON.stringify(event);
+    for(const [socket,peer] of peers){
+      if(socket.readyState!==WebSocket.OPEN) continue;
+      const actor=current(socket,peer);
+      if(!actor) continue;
+      let allowed;
+      try { allowed=allows(actor); } catch { allowed=false; }
+      if(allowed!==true) continue;
+      if(socket.bufferedAmount>maxBufferedBytes) socket.terminate();
+      else socket.send(data);
+    }
+  }
+  const roomIdIsValid=roomId=>typeof roomId==='string'&&roomIdPattern.test(roomId);
   return {
     notifyRoom(roomId){
-      if(typeof roomId!=='string'||!roomIdPattern.test(roomId)) return;
-      const data=JSON.stringify({type:'room.changed',roomId});
-      for(const [socket,peer] of peers){
-        if(socket.readyState!==WebSocket.OPEN) continue;
-        const actor=current(socket,peer);
-        if(!actor) continue;
-        let allowed;
-        try { allowed=canReadRoom(actor,roomId); } catch { allowed=false; }
-        if(allowed!==true) continue;
-        if(socket.bufferedAmount>maxBufferedBytes) socket.terminate();
-        else socket.send(data);
-      }
+      if(roomIdIsValid(roomId)) notify({type:'room.changed',roomId},actor=>canReadRoom(actor,roomId));
+    },
+    notifyContacts(first,second){
+      notify({type:'contacts.changed'},actor=>actor.id===first||actor.id===second);
+    },
+    notifyRoomRead(userId,roomId){
+      if(roomIdIsValid(roomId)) notify({type:'read.changed',roomId},actor=>actor.id===userId&&canReadRoom(actor,roomId));
     },
     close(){
       server.off('upgrade',upgrade);

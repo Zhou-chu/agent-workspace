@@ -133,6 +133,23 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (extension && await extension({ req,res,method,path,url,json,body,store,actor:auth(req) })) return;
         const actor=auth(req);
         if (!actor) reject(401,'Authentication required');
+        if(modern&&(path==='/api/direct'||path==='/api/contacts'||path.startsWith('/api/contacts/'))){
+          if(actor.kind!=='human'||req.headers.authorization!==undefined) reject(403,'Human session required');
+          if(method==='GET'&&path==='/api/contacts') return json(res,200,store.contacts.list(actor));
+          if(method==='GET'&&path==='/api/contacts/search') return json(res,200,{people:store.contacts.search(actor,url.searchParams.get('q'))});
+          if(method==='POST'&&(path==='/api/contacts/request'||path==='/api/contacts/accept'||path==='/api/direct')){
+            const input=await body(req);
+            if(path==='/api/direct'){
+              const {created,...room}=store.contacts.openDirect(actor,input.humanId);
+              if(created) realtime.notifyRoom(room.id);
+              return json(res,200,{room});
+            }
+            const {changed,...person}=path.endsWith('/request')?store.contacts.request(actor,input.humanId):store.contacts.accept(actor,input.humanId);
+            if(changed) realtime.notifyContacts?.(actor.id,person.id);
+            return json(res,200,{person});
+          }
+          reject(404,'Route not found');
+        }
         const bindingPath='/api/operator/session-bindings/';
         if (modern && actor.kind==='human' && actor.id!=='owner' &&
             !['/api/logout','/api/session','/api/rooms'].includes(path) && !path.startsWith('/api/rooms/')) reject(403,'Human owner required');
@@ -155,7 +172,7 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (method==='GET' && path==='/api/agents') return json(res,200,{agents:store.listAgents(actor)});
         if (method==='POST' && path==='/api/agents') return json(res,201,store.createAgent(actor,await body(req)));
         if (method==='POST' && path==='/api/rooms') return json(res,201,{room:store.createRoom(actor,await body(req))});
-        if (method==='GET' && path==='/api/rooms') return json(res,200,{rooms:store.listRooms(actor)});
+        if (method==='GET' && path==='/api/rooms') return json(res,200,{rooms:modern&&actor.kind==='human'?store.contacts.rooms(actor):store.listRooms(actor)});
         if (method==='GET' && path==='/api/hosts') return json(res,200,{hosts:store.hosts.list(actor)});
         if (method==='POST' && path==='/api/hosts') return json(res,201,store.hosts.register(actor,await body(req)));
         const hostOperation=/^\/api\/hosts\/([0-9a-z-]{1,80})\/(revoke|status-checks)$/i.exec(path);
@@ -175,6 +192,15 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (method==='GET' && path==='/api/decisions') return json(res,200,{decisions:store.listDecisions(actor)});
         if (method==='POST' && path==='/api/decisions') return json(res,201,{decision:store.createDecision(actor,await body(req))});
 
+        const roomRoute=/^\/api\/rooms\/([0-9a-z-]{1,80})(?:\/|$)/i.exec(path);
+        if(!modern&&roomRoute&&store.contacts.isDirect(roomRoute[1])) reject(404,'Room not found');
+        const readRoom=/^\/api\/rooms\/([0-9a-z-]{1,80})\/read$/i.exec(path);
+        if(modern&&method==='POST'&&readRoom){
+          if(actor.kind!=='human'||req.headers.authorization!==undefined) reject(403,'Human session required');
+          const {advanced,...result}=store.contacts.markRead(actor,readRoom[1],(await body(req)).cursor);
+          if(advanced) realtime.notifyRoomRead?.(actor.id,result.roomId);
+          return json(res,200,result);
+        }
         const members = /^\/api\/rooms\/([0-9a-z-]{1,80})\/members$/i.exec(path);
         if (members && method==='GET') return json(res,200,{members:store.listRoomMembers(actor,members[1])});
         if (members && method==='POST') {

@@ -38,3 +38,9 @@ npm --prefix e2e test
   the supervisor with real split processes. Windows PowerShell 5.1 checks
   a stand-alone Node rejection and validation of the runner's bundled npm.
   No hosted test writes a user runtime manifest or Scheduler task.
+
+## 好友、私聊与离线未读
+
+- `node --test test/core-im-contacts.test.mjs test/api-im-contacts.test.mjs`：互相确认、固定双人范围、普通会话与 Agent 游标隔离、持久未读、仅定向发送刷新提示。
+- `npm --prefix frontend test`：分页游标推进、去重、状态过期处理和已读条件。
+- `npm --prefix e2e test`：保留原真人群聊媒体场景；新增两会话验证，覆盖双人确认、私聊收发、在 General 不清除私聊未读、断线期间 124 条跨页消息及一条旧消息撤回。新增场景的真实 Chromium 结果以对应 CI 为准，不等同于真实终端/Tailnet/延迟验收。

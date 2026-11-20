@@ -192,3 +192,93 @@ test('two human accounts exchange, retract, transfer media and reconnect over li
     try { await browser?.close(); } finally { await stop(); }
   }
 });
+
+test('humans confirm friendship, exchange private messages and catch up across unread pages', async () => {
+  const {origin,ownerKey,stop} = await launch();
+  let browser;
+  try {
+    browser = await chromium.launch({executablePath:process.env.AGENTCHAT_CHROMIUM||undefined});
+    const aliceContext = await browser.newContext();
+    const bobContext = await browser.newContext();
+    let socket, allowReconnect = true;
+    await bobContext.routeWebSocket(/\/ws$/, route => {
+      if (!allowReconnect) { void route.close(); return; }
+      route.connectToServer();
+      socket = route;
+    });
+    const alice = await aliceContext.newPage();
+    const bob = await bobContext.newPage();
+    await login(alice,origin,ownerKey);
+    await alice.getByRole('button',{name:'设置',exact:true}).click();
+    await alice.getByRole('button',{name:'添加真人成员',exact:true}).click();
+    await alice.getByLabel('真人显示名称').fill('Bob');
+    await alice.getByRole('button',{name:'生成成员密钥',exact:true}).click();
+    const memberKey = await alice.getByTestId('human-invitation').textContent();
+    expect(memberKey).toBeTruthy();
+    await alice.getByRole('button',{name:'隐藏成员密钥',exact:true}).click();
+    await alice.getByRole('button',{name:'群聊',exact:true}).click();
+    await login(bob,origin,memberKey);
+    await expect.poll(()=>Boolean(socket)).toBe(true);
+
+    await alice.getByRole('button',{name:'联系人',exact:true}).click();
+    await alice.getByRole('searchbox',{name:'搜索用户',exact:true}).fill('Bob');
+    await alice.getByRole('button',{name:'搜索',exact:true}).click();
+    await alice.getByRole('listitem').filter({hasText:'Bob'}).getByRole('button',{name:'发起好友申请',exact:true}).click();
+    await expect(alice.getByRole('heading',{name:'发出的申请'})).toBeVisible();
+    await expect(alice.getByRole('button',{name:'发消息',exact:true})).toHaveCount(0);
+
+    await bob.getByRole('button',{name:'联系人',exact:true}).click();
+    await bob.getByRole('listitem').filter({hasText:'Alice'}).getByRole('button',{name:'接受好友申请',exact:true}).click();
+    await expect.poll(async () => (await alice.request.get(origin+'/api/contacts')).json()).toMatchObject({
+      friends:[{name:'Bob'}],incoming:[],outgoing:[],
+    });
+
+    await bob.getByRole('listitem').filter({hasText:'Alice'}).getByRole('button',{name:'发消息',exact:true}).click();
+    await expect(bob.getByRole('heading',{name:'Alice',exact:true})).toBeVisible();
+    const visibleRooms = async page => (await page.request.get(origin+'/api/rooms')).json().then(data=>data.rooms);
+    const bobRooms = await visibleRooms(bob);
+    const direct = bobRooms.find(room => room.kind === 'direct');
+    expect(direct?.peer.name).toBe('Alice');
+    await expect.poll(async () => (await visibleRooms(alice)).find(room => room.kind==='direct')?.id).toBe(direct.id);
+    await alice.getByRole('button',{name:'Bob',exact:true}).click();
+    await send(alice,'私聊起点');
+    await bob.bringToFront();
+    await expect(bob.locator('.message .body').getByText('私聊起点',{exact:true})).toBeVisible();
+
+    await expect.poll(async () => (await visibleRooms(bob)).find(room=>room.id===direct.id)?.unread).toBe(0);
+    // Bob is viewing General and must not clear unread for an unrelated DM.
+    await bob.getByRole('button',{name:'General',exact:true}).click();
+    await expect(bob.getByRole('heading',{name:'General',exact:true})).toBeVisible();
+    allowReconnect = false;
+    await socket.close();
+    await alice.locator('.message').filter({hasText:'私聊起点'})
+      .getByRole('button',{name:'撤回',exact:true}).click();
+    await send(alice,'离线队列首条');
+    // Use the same authorized HTTP endpoint for repeatable fixtures spanning two pages.
+    for (let index=1; index<=122; index++) {
+      const response = await alice.request.post(origin+'/api/rooms/'+direct.id+'/messages',{
+        data:{body:'离线批次 '+index,clientRequestId:'offline-fixture-'+index},
+      });
+      expect(response.status()).toBe(201);
+    }
+    await send(alice,'离线队列末条');
+    const directUnread = async () => (await visibleRooms(bob)).find(room=>room.id===direct.id)?.unread;
+    await expect.poll(directUnread).toBe(124);
+    allowReconnect = true;
+    const bobDirect = bob.getByRole('button',{name:'Alice',exact:true});
+    await expect(bobDirect).toHaveAccessibleDescription(/124/);
+    await expect.poll(directUnread).toBe(124);
+    await bob.bringToFront();
+    await bobDirect.click();
+    await expect(bob.getByText('消息已撤回',{exact:true})).toBeVisible();
+    await expect(bob.locator('.message .body').getByText('私聊起点',{exact:true})).toHaveCount(0);
+    await expect(bob.locator('.message .body').getByText('离线队列首条',{exact:true})).toHaveCount(1);
+    await expect(bob.locator('.message .body').getByText('离线队列末条',{exact:true})).toHaveCount(1);
+    await expect(bob.locator('.message .body').getByText(/^离线批次 /)).toHaveCount(122);
+    await expect.poll(directUnread).toBe(0);
+    await send(bob,'私聊已补齐');
+    await expect(alice.locator('.message .body').getByText('私聊已补齐',{exact:true})).toBeVisible();
+  } finally {
+    try { await browser?.close(); } finally { await stop(); }
+  }
+});

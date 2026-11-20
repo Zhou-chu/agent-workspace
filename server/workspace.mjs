@@ -2,6 +2,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { openHosts } from './hosts.mjs';
 import { openArtifacts } from './artifacts.mjs';
+import { openImContacts } from './im-contacts.mjs';
 import { openSessionBindings } from './session-bindings.mjs';
 
 export function reject(status, message) {
@@ -98,9 +99,9 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
   };
   const requireMembership = (a,r) => {
     requireActor(a);
-    if (!get('SELECT 1 FROM members WHERE room_id=? AND actor_id=?', r, a.id)) reject(404, 'Room not found');
+    if (!contacts.visible(a.id,r)||!get('SELECT 1 FROM members WHERE room_id=? AND actor_id=?', r, a.id)) reject(404, 'Room not found');
   };
-  const canReadRoom = (a,r) => Boolean(a?.id && getActor(a.id)?.enabled &&
+  const canReadRoom = (a,r) => Boolean(a?.id && getActor(a.id)?.enabled && contacts.visible(a.id,r) &&
     get('SELECT 1 FROM members WHERE room_id=? AND actor_id=?',r,a.id));
   const publicAttachment = r => ({id:r.id,name:r.name,mime:r.mime,kind:r.kind,size:r.size});
   const attachmentFor = messageId => get('SELECT id,name,mime,kind,size FROM message_attachments WHERE message_id=?',messageId);
@@ -122,10 +123,11 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
   const authenticateHumanSession = token => typeof token === 'string' && SESSION_TOKEN.test(token)
     ? actor(get(`SELECT a.* FROM human_sessions s JOIN actors a ON a.id=s.actor_id
       WHERE s.hash=? AND s.expires>? AND a.kind='human' AND a.enabled=1`,digest(token),clock())) ?? null : null;
+  const contacts=openImContacts(db,{get,all,run,tx,reject,requireActor,requireMembership,now});
   const hosts=openHosts(db,{clock,requireOwner,tx});
   const bindings=openSessionBindings(db,{requireOwner,requireMembership,reject,tx});
   return {
-    owner: getActor('owner'), hosts, sessionBindings:bindings.owner, health: () => get('SELECT 1'), close: () => db.close(),
+    owner: getActor('owner'), hosts, contacts, sessionBindings:bindings.owner, health: () => get('SELECT 1'), close: () => db.close(),
     artifacts:openArtifacts(db,{requireMembership,tx,reject}),
     authenticateAgent(token) {
       return typeof token === 'string' && token.length <= 512 && token.startsWith('aw_agent_')
@@ -190,7 +192,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     },
     listRooms(a) {
       requireActor(a);
-      return all('SELECT r.id,r.name FROM rooms r JOIN members m ON m.room_id=r.id WHERE m.actor_id=? ORDER BY r.name',a.id).map(r=>({...r}));
+      return all('SELECT r.id,r.name FROM rooms r JOIN members m ON m.room_id=r.id WHERE m.actor_id=? AND NOT EXISTS(SELECT 1 FROM direct_rooms d WHERE d.room_id=r.id) ORDER BY r.name',a.id).map(r=>({...r}));
     },
     createRoom(a,input) {
       requireOwner(a);
@@ -210,6 +212,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       bool(member);
       return tx(() => {
         requireMembership(a,roomId);
+        if(contacts.isDirect(roomId)) reject(409,'Direct conversation participants are fixed');
         const target=getActor(agentId);
         if (target?.kind!=='agent'||target.ownerId!==a.id) reject(404,'Agent not found');
         if (member) {
@@ -229,6 +232,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       bool(member);
       return tx(() => {
         requireMembership(a,roomId);
+        if(contacts.isDirect(roomId)) reject(409,'Direct conversation participants are fixed');
         const target=getActor(humanId);
         if (target?.kind!=='human' || target.id===OWNER_ID) reject(404,'Collaborator not found');
         if (member) {
