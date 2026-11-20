@@ -44,3 +44,8 @@ npm --prefix e2e test
 - `node --test test/core-im-contacts.test.mjs test/api-im-contacts.test.mjs`：互相确认、固定双人范围、普通会话与 Agent 游标隔离、持久未读、仅定向发送刷新提示。
 - `npm --prefix frontend test`：分页游标推进、去重、状态过期处理和已读条件。
 - `npm --prefix e2e test`：保留原真人群聊媒体场景；新增两会话验证，覆盖双人确认、私聊收发、在 General 不清除私聊未读、断线期间 124 条跨页消息及一条旧消息撤回。新增场景的真实 Chromium 结果以对应 CI 为准，不等同于真实终端/Tailnet/延迟验收。
+
+## 真人管理群
+
+- `node --test test/core-im-groups.test.mjs test/api-im-groups.test.mjs`：两段确认、当前角色、转让／移除／离开、公告、重启持久化、旧路由与私聊边界、实时成员撤销。
+- Playwright 第三场景用三个独立浏览器会话覆盖：创建和邀友、普通成员提请审核、受邀人接受、公告可见、管理员权限边界、群主转让、第三位成员被移出后的页面撤销。实际结果以对应 CI 为准。

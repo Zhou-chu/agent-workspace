@@ -3,7 +3,7 @@ import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const assets=['app.mjs','chat-model.mjs','host-model.mjs','icons.mjs','index.html','styles.css'];
+const assets=['app.mjs','chat-model.mjs','host-model.mjs','icons.mjs','index.html','managed-groups.mjs','styles.css'];
 
 function requireKnownFiles(entries) {
   if (entries.some(entry=>!entry.isFile()||!assets.includes(entry.name))) {

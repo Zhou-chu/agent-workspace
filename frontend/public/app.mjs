@@ -1,6 +1,7 @@
 import { chooseRoom, collectRoomPages, contactAction, createChatPayload, mergeMessages, visibleReadCursor } from './chat-model.mjs';
 import { hostStatus, checkStatus, mayRequestCheck, nextCheckRequestId } from './host-model.mjs';
 import { icon } from './icons.mjs';
+import { createGroupInvites, createManagedMemberPanel } from './managed-groups.mjs';
 
 const root = document.querySelector('main');
 const state = {
@@ -78,15 +79,24 @@ function startRealtime() {
     if(state.page==='chat') state.reconcile?.();
   });
   socket.addEventListener('message',({data})=>{
-    if(socket!==imSocket || state.page!=='chat') return;
+    if(socket!==imSocket) return;
     let event;
     try { event=JSON.parse(data); } catch { return; }
+    if(event?.type==='group-membership.changed'&&typeof event.roomId==='string') {
+      if(state.discardManagedRoom) state.discardManagedRoom(event.roomId);
+      else discardCachedGroup(event.roomId);
+    }
+    if(state.page!=='chat') return;
     if(event?.type==='room.changed'&&typeof event.roomId==='string') {
       state.refreshRooms?.();
-      if(event.roomId===state.roomId) state.sync?.();
+      if(event.roomId===state.roomId) {state.sync?.();state.refreshManagedGroup?.();}
     }
     if(event?.type==='read.changed') state.refreshRooms?.();
     if(event?.type==='contacts.changed') state.refreshContacts?.();
+    if(event?.type==='group-invites.changed') {
+      state.refreshGroupInvites?.();
+      state.refreshManagedGroup?.();
+    }
   });
   socket.addEventListener('close',()=>{
     if(socket!==imSocket) return;
@@ -114,6 +124,23 @@ function humanTime(value) {
   const date = new Date(value);
   return value != null && !Number.isNaN(date.valueOf()) ? timestamp.format(date) : '';
 }
+function purgeRoomView(id) {
+  const path='/api/rooms/'+encodeURIComponent(id)+'/';
+  for(const key of drafts.keys()) if(key.startsWith(path)) drafts.delete(key);
+  for(const key of feedPositions.keys()) if(key.startsWith(path)) feedPositions.delete(key);
+}
+function discardCachedGroup(id) {
+  purgeRoomView(id);
+  if(state.roomId===id) {
+    state.roomId=null;
+    state.thread=null;
+    state.items=[];
+    state.cursor=null;
+    state.hasMore=false;
+  }
+  state.rooms=state.rooms.filter(room=>room.id!==id);
+  if(storage.get('workspace.room')===id) storage.set('workspace.room','');
+}
 function mountLogin(text = '') {
   stopRealtime();
   state.epoch += 1;
@@ -121,6 +148,7 @@ function mountLogin(text = '') {
   state.stopRecording=undefined;
   state.session = null;
   state.reconcile = state.refreshRooms = state.refreshContacts = state.sync = state.tick = undefined;
+  state.refreshGroupInvites = state.refreshManagedGroup = state.discardManagedRoom = undefined;
   state.items = [];
   state.rooms = [];
   state.roomId = null;
@@ -191,6 +219,7 @@ async function changePage(page) {
   state.stopRecording?.();
   state.stopRecording=undefined;
   state.reconcile = state.refreshRooms = state.refreshContacts = state.sync = state.tick = undefined;
+  state.refreshGroupInvites = state.refreshManagedGroup = state.discardManagedRoom = undefined;
   const target = frame(page);
   try {
     if (page === 'chat') await chatPage(target, active);
@@ -312,12 +341,26 @@ function contactsPanel(active, openDirect) {
 async function chatPage(target, epoch) {
   const loaded = await api('/api/rooms');
   if (epoch !== state.epoch) return;
+  const loadedIds=new Set(loaded.rooms.map(room=>room.id));
+  for(const room of state.rooms) if(room.managed===true&&!loadedIds.has(room.id)) purgeRoomView(room.id);
   state.rooms = loaded.rooms;
   state.roomId = chooseRoom(state.rooms, state.roomId ?? storage.get('workspace.room'));
   const roomRows = el('div', { class: 'room-rows' });
   const roomHead = el('div', { class: 'room-section-head' });
   const roomCreate = el('div', { class: 'room-create' });
   const modern = state.session.imRealtime === true;
+  const managedGroups = modern && state.session.managedGroups===true && state.session.user.kind==='human';
+  const managedUI = {el,button,iconButton,notice,listRows,humanTime,field,api,post};
+  const groupInvites = managedGroups ? createGroupInvites(managedUI,{
+    userId:state.session.user.id,active:()=>activeChat(),
+    openRoom:async id=>{
+      const {room}=await api('/api/im/groups/'+encodeURIComponent(id));
+      if(!activeChat()) return;
+      if(!state.rooms.some(item=>item.id===id)) state.rooms.push(room);
+      selectRoom(id);
+      void refreshRooms();
+    },
+  }) : null;
   const contacts = modern && state.session.user.kind==='human'
     ? contactsPanel(()=>chat.isConnected && state.page==='chat',room=>{
       if(!state.rooms.some(item=>item.id===room.id)) state.rooms.push(room);
@@ -327,7 +370,7 @@ async function chatPage(target, epoch) {
     }) : null;
   const rooms = el('aside', { class: 'room-list', 'aria-label': modern ? '会话列表' : '群聊列表' },
     el('div', { class: 'workspace-masthead' }, el('span', { class: 'overline' }, '工作台'), el('h2', {}, 'AgentChat')),
-    el('section', { class: 'room-index' }, roomHead, roomCreate, contacts?.panel, roomRows),
+    el('section', { class: 'room-index' }, roomHead, roomCreate, contacts?.panel, groupInvites?.panel, roomRows),
     el('div', { class: 'workspace-account' }, el('div', { class: 'workspace-account-mark', 'aria-hidden': 'true' },
       Array.from(state.session.user.name)[0] ?? '·'), el('span', {}, state.session.user.name)));
   const chat = el('div', { class: 'chat' }, rooms);
@@ -366,6 +409,8 @@ async function chatPage(target, epoch) {
       const {rooms:next}=await api('/api/rooms');
       if(!activeChat()||roomRefreshQueued) return;
       if(JSON.stringify(next)===JSON.stringify(state.rooms)) return;
+      const nextIds=new Set(next.map(room=>room.id));
+      for(const room of state.rooms) if(room.managed===true&&!nextIds.has(room.id)) purgeRoomView(room.id);
       state.rooms=next;
       if(!next.some(room=>room.id===state.roomId)) {
         state.roomId=chooseRoom(next,null);
@@ -379,37 +424,94 @@ async function chatPage(target, epoch) {
       if(roomRefreshQueued){roomRefreshQueued=false;void refreshRooms();}
     }
   }
+  function discardManagedRoom(id) {
+    purgeRoomView(id);
+    if(state.rooms.some(room=>room.id===id)) {
+      state.rooms=state.rooms.filter(room=>room.id!==id);
+      if(state.roomId===id) {
+        state.thread=null;
+        state.mobile=false;
+        state.roomId=chooseRoom(state.rooms,null);
+        if(state.roomId) storage.set('workspace.room',state.roomId);
+        openRoom();
+      } else paintRooms();
+    }
+    void refreshRooms();
+  }
+
   function setRoomControls() {
-    const name = el('input', { required: '', maxlength: '80' });
+    const name = el('input', { required: '', maxlength: managedGroups?'120':'80' });
     const info = notice('alert');
+    const friends=el('fieldset',{class:'group-create-friends'});
+    let friendRequest=0;
+    async function loadFriends() {
+      const attempt=++friendRequest;
+      friends.replaceChildren(el('legend',{},'邀请好友'),el('p',{role:'status'},'正在载入好友…'));
+      try {
+        const {friends:available}=await api('/api/contacts');
+        if(!activeChat()||attempt!==friendRequest) return;
+        friends.replaceChildren(el('legend',{},'邀请好友'),
+          available.length?el('div',{class:'group-create-choices'},...available.map(friend=>{
+            const pick=el('input',{type:'checkbox',name:'group-friend',value:friend.id});
+            return el('label',{},pick,el('span',{},friend.name));
+          })):el('p',{class:'muted'},'暂无好友，可创建后再邀请。'));
+      } catch(error) {
+        if(activeChat()&&attempt===friendRequest) friends.replaceChildren(el('legend',{},'邀请好友'),el('p',{role:'alert'},'未能载入好友：'+error.message));
+      }
+    }
     const submit = el('button', { type: 'submit', class: 'primary' }, '创建');
     const add = el('form', { class: 'inline-form', onsubmit: async event => {
       event.preventDefault(); submit.disabled = true;
       try {
-        const { room } = await post('/api/rooms', { name: name.value.trim() });
-        if (!chat.isConnected) return;
-        state.rooms.push(room);
+        info.textContent='';
+        const invitees=Array.from(friends.querySelectorAll('input:checked'),input=>input.value);
+        const { room } = await post(managedGroups?'/api/im/groups':'/api/rooms', { name: name.value.trim() });
+        if (!activeChat()) return;
+        if(!state.rooms.some(item=>item.id===room.id)) state.rooms.push(room);
+        if(managedGroups) {
+          const path='/api/im/groups/'+encodeURIComponent(room.id)+'/invites';
+          const outcomes=await Promise.allSettled(invitees.map(userId=>post(path,{userId})));
+          if(!activeChat()) return;
+          const failed=outcomes.filter(outcome=>outcome.status==='rejected').length;
+          if(failed) {
+            info.textContent='群聊已创建，'+failed+' 个邀请未发出。可在群成员面板重新邀请。';
+            name.value='';
+            for(const input of friends.querySelectorAll('input:checked')) input.checked=false;
+            paintRooms();
+            void refreshRooms();
+            return;
+          }
+        }
+        name.value='';
         roomCreate.hidden=true;
         createToggle.setAttribute('aria-expanded','false');
         selectRoom(room.id);
         void refreshRooms();
       } catch (error) { info.textContent = error.message; }
       finally { submit.disabled = false; }
-    } }, field('群聊名称', name), submit, info);
+    } }, field('群聊名称', name), managedGroups?friends:null, submit, info);
     const createToggle = iconButton('新建群聊', 'plus', () => {
       roomCreate.hidden = !roomCreate.hidden;
       createToggle.setAttribute('aria-expanded', String(!roomCreate.hidden));
-      if (!roomCreate.hidden) name.focus();
+      if (!roomCreate.hidden) {name.focus();if(managedGroups) void loadFriends();}
     }, { class: 'icon-button', 'aria-expanded': 'false' });
     roomHead.replaceChildren(el('h2', {}, modern?'会话':'群聊'), el('div',{class:'row room-actions'},
-      contacts?.toggle, state.session.user.id === 'owner' ? createToggle : null));
+      contacts?.toggle, groupInvites?.toggle, managedGroups||state.session.user.id==='owner'?createToggle:null));
     roomCreate.hidden = true;
     roomCreate.replaceChildren(add);
   }
   setRoomControls();
   state.refreshRooms=refreshRooms;
   state.refreshContacts=contacts?.refresh;
-  state.reconcile=()=>{void refreshRooms();void contacts?.refresh();state.sync?.();};
+  state.refreshGroupInvites=groupInvites?.refresh;
+  state.discardManagedRoom=managedGroups?discardManagedRoom:undefined;
+  state.reconcile=()=>{
+    void refreshRooms();
+    void contacts?.refresh();
+    void groupInvites?.refresh();
+    state.refreshManagedGroup?.();
+    state.sync?.();
+  };
   function openRoom() {
     const marker = ++state.epoch;
     state.stopRecording?.();
@@ -417,6 +519,7 @@ async function chatPage(target, epoch) {
     const room = state.rooms.find(item => item.id === state.roomId);
     const thread = state.thread;
     const direct = room?.kind==='direct';
+    const managed = managedGroups&&room?.managed===true;
     const roomPath = '/api/rooms/' + encodeURIComponent(state.roomId ?? '');
     const path = roomPath + '/messages';
     const viewKey = roomPath + '/' + (thread?.id ?? '');
@@ -429,7 +532,7 @@ async function chatPage(target, epoch) {
     state.pending = false;
     chat.dataset.mobile = state.mobile ? 'conversation' : 'rooms';
     paintRooms();
-    state.tick=state.sync=undefined;
+    state.tick=state.sync=state.refreshManagedGroup=undefined;
     chat.querySelector('.conversation')?.remove();
     if (!room) return;
     const info = notice('status');
@@ -546,7 +649,7 @@ async function chatPage(target, epoch) {
       if (!state.items.length) feed.append(el('li', { class: 'chat-empty' },
         el('div', { class: 'empty-icon', 'aria-hidden': 'true' }, icon(thread ? 'thread' : 'hash')),
         el('h2', {}, thread ? '还没有回复' : '这里还没有消息'),
-        el('p', {}, thread ? '写一条回复，继续当前讨论。' : direct ? '写一条消息开始私聊。' : '写一条消息开始协作。需要对方接手时，再选中 @ 成员。')));
+        el('p', {}, thread ? '写一条回复，继续当前讨论。' : direct ? '写一条消息开始私聊。' : managed ? '写一条消息开始群聊。' : '写一条消息开始协作。需要对方接手时，再选中 @ 成员。')));
       if (state.hasMore) feed.append(el('li', { class: 'load-more' }, button('加载更多消息', () => refresh(true))));
       if (focusedMessage && focusedAction) {
         const replacement = [...feed.querySelectorAll('[data-message]')].find(node => node.dataset.message === focusedMessage);
@@ -755,9 +858,12 @@ async function chatPage(target, epoch) {
         }
       } finally { submit.disabled = false; }
     } }, el('div', { class: 'composer-context' }, reply, selected, choices), mediaControls,
-      el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, direct?null:toggle, submit)));
+      el('div', { class: 'composer-field' }, input, el('div', { class: 'composer-actions' }, direct||managed?null:toggle, submit)));
     const heading = el('h1', { tabindex: '-1' }, thread ? '线程' : room.name);
-    const memberPanel = el('div', { class: 'member-panel', hidden: '' });
+    const group=managed ? createManagedMemberPanel(managedUI,{
+      userId:state.session.user.id,roomId:room.id,active:()=>marker===state.epoch,onLeave:discardManagedRoom,
+    }) : null;
+    const memberPanel = group?.panel ?? el('div', { class: 'member-panel', hidden: '' });
     async function refreshMembers() {
       try {
         const result = await api(roomPath + '/members');
@@ -788,7 +894,7 @@ async function chatPage(target, epoch) {
     const memberButton = iconButton('成员', 'people', () => {
       memberPanel.hidden = !memberPanel.hidden;
       memberButton.setAttribute('aria-expanded', String(!memberPanel.hidden));
-      if (!memberPanel.hidden) refreshMembers();
+      if (!memberPanel.hidden) {if(group) void group.refresh();else void refreshMembers();}
     }, { class: 'icon-button', 'aria-expanded': 'false' });
     const back = iconButton(modern?'返回会话列表':'返回群聊列表', 'arrow', () => { state.mobile = false; chat.dataset.mobile = 'rooms'; rooms.querySelector('[aria-current]')?.focus(); }, { class: 'mobile-back icon-button' });
     const threadBack = thread ? iconButton('返回群聊', 'arrow', () => {
@@ -805,7 +911,8 @@ async function chatPage(target, epoch) {
     chat.append(conversation);
     paintMentions(); paintReply();
     refresh(true);
-    if (!direct) void refreshMembers();
+    if(!direct&&!group) void refreshMembers();
+    state.refreshManagedGroup=group?.refresh;
     state.tick = () => refresh();
     state.sync = () => {acknowledgeRead();return refresh(true,true);};
   }

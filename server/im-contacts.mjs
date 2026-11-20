@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export function openImContacts(db,{get,all,run,tx,reject,requireActor,requireMembership,now}) {
+export function openImContacts(db,{get,all,run,tx,reject,requireActor,requireMembership,now,isManaged}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS friendships (
       lo TEXT NOT NULL REFERENCES actors(id), hi TEXT NOT NULL REFERENCES actors(id),
@@ -48,7 +48,7 @@ export function openImContacts(db,{get,all,run,tx,reject,requireActor,requireMem
      AND m.seq>COALESCE((SELECT cursor FROM human_room_reads WHERE actor_id=? AND room_id=?),0)) unread`,id,room,room,id,id,room);
   const roomInfo=(actor,room,peer)=>({
     id:room.id,name:peer?.name??room.name,kind:peer?'direct':'group',...(peer?{peer:person(peer)}:{}),
-    unread:state(actor.id,room.id).unread
+    ...(!peer&&isManaged(room.id)?{managed:true}:{}), unread:state(actor.id,room.id).unread
   });
   return {
     visible,

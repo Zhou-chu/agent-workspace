@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { openHosts } from './hosts.mjs';
 import { openArtifacts } from './artifacts.mjs';
 import { openImContacts } from './im-contacts.mjs';
+import { openImGroups } from './im-groups.mjs';
 import { openSessionBindings } from './session-bindings.mjs';
 
 export function reject(status, message) {
@@ -123,11 +124,12 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
   const authenticateHumanSession = token => typeof token === 'string' && SESSION_TOKEN.test(token)
     ? actor(get(`SELECT a.* FROM human_sessions s JOIN actors a ON a.id=s.actor_id
       WHERE s.hash=? AND s.expires>? AND a.kind='human' AND a.enabled=1`,digest(token),clock())) ?? null : null;
-  const contacts=openImContacts(db,{get,all,run,tx,reject,requireActor,requireMembership,now});
+  const groups=openImGroups(db,{get,all,run,tx,reject,requireActor,now});
+  const contacts=openImContacts(db,{get,all,run,tx,reject,requireActor,requireMembership,now,isManaged:groups.managed});
   const hosts=openHosts(db,{clock,requireOwner,tx});
   const bindings=openSessionBindings(db,{requireOwner,requireMembership,reject,tx});
   return {
-    owner: getActor('owner'), hosts, contacts, sessionBindings:bindings.owner, health: () => get('SELECT 1'), close: () => db.close(),
+    owner: getActor('owner'), hosts, contacts, groups, sessionBindings:bindings.owner, health: () => get('SELECT 1'), close: () => db.close(),
     artifacts:openArtifacts(db,{requireMembership,tx,reject}),
     authenticateAgent(token) {
       return typeof token === 'string' && token.length <= 512 && token.startsWith('aw_agent_')
@@ -192,7 +194,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
     },
     listRooms(a) {
       requireActor(a);
-      return all('SELECT r.id,r.name FROM rooms r JOIN members m ON m.room_id=r.id WHERE m.actor_id=? AND NOT EXISTS(SELECT 1 FROM direct_rooms d WHERE d.room_id=r.id) ORDER BY r.name',a.id).map(r=>({...r}));
+      return all('SELECT r.id,r.name FROM rooms r JOIN members m ON m.room_id=r.id WHERE m.actor_id=? AND NOT EXISTS(SELECT 1 FROM direct_rooms d WHERE d.room_id=r.id) AND NOT EXISTS(SELECT 1 FROM managed_groups g WHERE g.room_id=r.id) ORDER BY r.name',a.id).map(r=>({...r}));
     },
     createRoom(a,input) {
       requireOwner(a);
@@ -213,6 +215,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       return tx(() => {
         requireMembership(a,roomId);
         if(contacts.isDirect(roomId)) reject(409,'Direct conversation participants are fixed');
+        if(groups.managed(roomId)) reject(409,'Use managed group membership operations');
         const target=getActor(agentId);
         if (target?.kind!=='agent'||target.ownerId!==a.id) reject(404,'Agent not found');
         if (member) {
@@ -233,6 +236,7 @@ export function openWorkspace(path, ownerName = 'Owner', {clock=Date.now}={}) {
       return tx(() => {
         requireMembership(a,roomId);
         if(contacts.isDirect(roomId)) reject(409,'Direct conversation participants are fixed');
+        if(groups.managed(roomId)) reject(409,'Use managed group membership operations');
         const target=getActor(humanId);
         if (target?.kind!=='human' || target.id===OWNER_ID) reject(404,'Collaborator not found');
         if (member) {

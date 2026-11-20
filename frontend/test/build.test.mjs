@@ -9,7 +9,7 @@ test('build emits exactly the same assets as the application serves', async t=>{
   const tmp=await mkdtemp(join(tmpdir(),'aw-frontend-build-'));
   t.after(()=>rm(tmp,{recursive:true,force:true}));
   const out=join(tmp,'dist');
-  const assets=['app.mjs','chat-model.mjs','host-model.mjs','icons.mjs','index.html','styles.css'];
+  const assets=['app.mjs','chat-model.mjs','host-model.mjs','icons.mjs','index.html','managed-groups.mjs','styles.css'];
   await buildFrontend(out);
   assert.deepEqual((await readdir(out)).sort(),assets);
   for (const asset of assets) {

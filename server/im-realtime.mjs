@@ -12,7 +12,7 @@ function rejectUpgrade(socket,status){
   socket.end(`HTTP/1.1 ${status} ${reasons[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
-export function createImRealtime(server,{authenticate,allowOrigin,canReadRoom}){
+export function createImRealtime(server,{authenticate,allowOrigin,canReadRoom,canManageGroup=()=>false}){
   const service=new WebSocketServer({noServer:true,maxPayload:1024,perMessageDeflate:false});
   const peers=new Map();
   function actorFor(request){
@@ -79,6 +79,13 @@ export function createImRealtime(server,{authenticate,allowOrigin,canReadRoom}){
     },
     notifyContacts(first,second){
       notify({type:'contacts.changed'},actor=>actor.id===first||actor.id===second);
+    },
+    notifyGroupInvites(roomId,inviterId,inviteeId){
+      if(roomIdIsValid(roomId)) notify({type:'group-invites.changed'},
+        actor=>actor.id===inviterId||actor.id===inviteeId||canManageGroup(actor,roomId));
+    },
+    notifyGroupMembership(userId,roomId){
+      if(roomIdIsValid(roomId)) notify({type:'group-membership.changed',roomId},actor=>actor.id===userId);
     },
     notifyRoomRead(userId,roomId){
       if(roomIdIsValid(roomId)) notify({type:'read.changed',roomId},actor=>actor.id===userId&&canReadRoom(actor,roomId));

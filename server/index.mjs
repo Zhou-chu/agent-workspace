@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { digest, openWorkspace, reject } from './workspace.mjs';
 import { artifactDisposition } from './artifacts.mjs';
+import { handleGroupRequest, isGroupPath } from './im-group-http.mjs';
 import { attachmentService, localImStorage, mediaDisposition } from './im-attachments.mjs';
 
 const cookieName = 'workspace_session';
@@ -150,6 +151,7 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
           }
           reject(404,'Route not found');
         }
+        if(modern&&isGroupPath(path)) return await handleGroupRequest({req,res,method,path,actor,groups:store.groups,realtime,body,json,reject});
         const bindingPath='/api/operator/session-bindings/';
         if (modern && actor.kind==='human' && actor.id!=='owner' &&
             !['/api/logout','/api/session','/api/rooms'].includes(path) && !path.startsWith('/api/rooms/')) reject(403,'Human owner required');
@@ -167,7 +169,7 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
           store.revokeHumanSession(cookie(req));
           return json(res,200,{ok:true},{'Set-Cookie':cookieValue('',secureCookies,true)});
         }
-        if (method==='GET' && path==='/api/session') return json(res,200,{user:actor,agents:store.listAgents(actor),...(modern?{imRealtime:true}: {})});
+        if (method==='GET' && path==='/api/session') return json(res,200,{user:actor,agents:store.listAgents(actor),...(modern?{imRealtime:true,managedGroups:true}: {})});
         if (modern && method==='POST' && path==='/api/humans') return json(res,201,store.provisionHuman(actor,await body(req)));
         if (method==='GET' && path==='/api/agents') return json(res,200,{agents:store.listAgents(actor)});
         if (method==='POST' && path==='/api/agents') return json(res,201,store.createAgent(actor,await body(req)));
@@ -193,7 +195,8 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
         if (method==='POST' && path==='/api/decisions') return json(res,201,{decision:store.createDecision(actor,await body(req))});
 
         const roomRoute=/^\/api\/rooms\/([0-9a-z-]{1,80})(?:\/|$)/i.exec(path);
-        if(!modern&&roomRoute&&store.contacts.isDirect(roomRoute[1])) reject(404,'Room not found');
+        if(roomRoute&&((!modern&&store.contacts.isDirect(roomRoute[1]))||
+          (store.groups.managed(roomRoute[1])&&(!modern||req.headers.authorization!==undefined)))) reject(404,'Room not found');
         const readRoom=/^\/api\/rooms\/([0-9a-z-]{1,80})\/read$/i.exec(path);
         if(modern&&method==='POST'&&readRoom){
           if(actor.kind!=='human'||req.headers.authorization!==undefined) reject(403,'Human session required');
@@ -284,6 +287,7 @@ export function createWorkspaceServer({ store, ownerToken, webDir=webDefault, se
       authenticate:req=>store.authenticateHumanSession(cookie(req)),
       allowOrigin:req=>req.headers['sec-fetch-site']!=='cross-site'&&req.headers.origin===trustedOrigin(req),
       canReadRoom:(actor,id)=>store.canReadRoom(actor,id),
+      canManageGroup:(actor,id)=>store.groups.canManage(actor,id),
     });
     server.stopImRealtime=()=>realtime.close();
   }

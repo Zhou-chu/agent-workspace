@@ -179,3 +179,13 @@ same origin returns HTTP 401 with Content-Type application/json without
 credentials. The authenticated WebSocket trial is separately run against
 disposable data. The periodic controller checks child processes when it
 polls; it is not an immediate or continuous runtime liveness monitor.
+
+### Managed human group data and older releases
+
+Do not treat a pre-managed-group binary as a supported rollback once users
+are creating managed groups. The persistent table guards block old writes
+that directly alter managed membership, but an older frontend/backend does
+not implement role-aware invitations, announcements, or live removal UI.
+Use a forward fix, or an explicitly approved migration rollback with a
+verified snapshot and an accounting of writes made after that snapshot.
+This note does not authorize restoring or changing the desktop database.

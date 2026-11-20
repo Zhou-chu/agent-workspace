@@ -246,3 +246,27 @@ summary { cursor: pointer; width: max-content; max-width: 100%; min-height: 42px
 .media-picker input {position:absolute; inset:0; width:100%; opacity:0; cursor:pointer;}
 .chat-image {display:block; max-width:min(100%,32rem); max-height:22rem; object-fit:contain; border-radius:.35rem;}
 .message audio {display:block; max-width:100%;}
+
+.group-create-friends { min-width: 0; border: 0; margin: .25rem 0; padding: 0; }
+.group-create-friends legend { font-size: .82rem; color: var(--muted); margin-bottom: .3rem; }
+.group-create-choices { max-height: 11rem; overflow: auto; }
+.group-create-choices label { display: flex; align-items: center; gap: .4rem; min-height: 32px; overflow-wrap: anywhere; }
+.group-invite-toggle { position: relative; }
+.group-invite-badge { position: absolute; top: 0; right: 0; min-width: .9rem; padding-inline: .15rem; border-radius: 1rem; background: var(--ink); color: var(--index); font-size: .62rem; line-height: .9rem; }
+.group-invite-content .list li { padding-block: .4rem; }
+.group-invite-row { display: grid; gap: .2rem; font-size: .84rem; }
+.group-invite-row .row { flex-wrap: wrap; gap: .25rem; }
+.managed-member-panel { max-height: 42dvh; }
+.group-admin-content { display: grid; gap: 1rem; }
+.group-admin-content .list li { padding-block: .5rem; }
+.group-admin-content .row { justify-content: flex-start; }
+.group-member-row { display: grid; gap: .3rem; }
+.group-member-identity { display: flex; align-items: center; flex-wrap: wrap; gap: .25rem .6rem; }
+.group-confirm { border: 1px solid var(--control-line); padding: .65rem; margin-block: .45rem; }
+.group-form { display: grid; gap: .35rem; margin-block: .35rem; }
+.group-form textarea, .group-form select { width: 100%; }
+.group-form button { justify-self: start; }
+.group-announcement p { white-space: pre-wrap; }
+@media (max-width: 760px) {
+  .group-create-choices label, .group-admin-content button { min-height: 44px; }
+}
