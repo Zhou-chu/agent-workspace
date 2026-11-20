@@ -190,7 +190,7 @@ export function createManagedMemberPanel(ui, {userId, active, roomId, onLeave}) 
     const currentMembers=new Set(details.members.map(member=>member.id));
     const choices=friends.filter(friend=>!currentMembers.has(friend.id));
     if(!choices.length) return el('p',{class:'muted'},'没有可邀请的好友。');
-    const select=el('select',{required:'',onchange:()=>{selectedFriend=select.value;}},
+    const select=el('select',{'aria-label':'选择好友',required:'',onchange:()=>{selectedFriend=select.value;}},
       el('option',{value:''},'请选择好友'),...choices.map(friend=>el('option',{value:friend.id},friend.name)));
     select.value=choices.some(friend=>friend.id===selectedFriend)?selectedFriend:'';
     const send=el('button',{type:'submit',class:'primary'},'发送邀请');

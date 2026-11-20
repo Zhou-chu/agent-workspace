@@ -139,6 +139,7 @@ test('managed group UI exercises real admission, roles, announcements and member
   await until(()=>doc.querySelector('.group-announcement p')?.textContent==='先阅读接口约定。','pre-join announcement after acceptance');
   await click('邀请好友');
   const select=await until(()=>input('选择好友','select'),'friend choices');
+  assert.equal(select.getAttribute('aria-label'),'选择好友','friend picker name must not include option text');
   select.value=carol.id;
   submit(select);
   await until(()=>doc.body.textContent.includes('已发出邀请。'),'invitation submitted');

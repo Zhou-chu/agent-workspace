@@ -330,11 +330,10 @@ test('three humans review group invitations, transfer authority and remove acces
       await api(bob,'/api/contacts/request',{humanId:carolIdentity.id});
       await api(carol,'/api/contacts/accept',{humanId:bobIdentity.id});
 
-      await phase('create room and accept initial invitation',async ()=>{
-
     });
 
-    await button(alice,'新建群聊').click();
+    await phase('create room and accept initial invitation',async ()=>{
+      await button(alice,'新建群聊').click();
       await alice.getByLabel('群聊名称',{exact:true}).fill(roomName);
       await alice.getByRole('checkbox',{name:'Bob',exact:true}).check();
       await button(alice,'创建').click();
@@ -344,11 +343,10 @@ test('three humans review group invitations, transfer authority and remove acces
       await expect(button(bob,roomName)).toHaveCount(0);
       await acceptInvitation(bob,roomName);
 
-      await phase('regular member submits reviewed invitation',async ()=>{
-
     });
 
-    await openMembers(bob);
+    await phase('regular member submits reviewed invitation',async ()=>{
+      await openMembers(bob);
       await expect(person(bob,'Bob').getByText('成员',{exact:true})).toBeVisible();
       await button(bob,'邀请好友').click();
       await bob.getByLabel('选择好友',{exact:true}).selectOption({label:'Carol'});
@@ -358,11 +356,10 @@ test('three humans review group invitations, transfer authority and remove acces
       await button(carol,'群聊邀请').click();
       await expect(button(carol,roomName)).toHaveCount(0);
 
-      await phase('owner approves and guest accepts',async ()=>{
-
     });
 
-    await openMembers(alice);
+    await phase('owner approves and guest accepts',async ()=>{
+      await openMembers(alice);
       await alice.getByRole('listitem').filter({hasText:/Bob.*Carol/}).getByRole('button',{name:'批准邀请',exact:true}).click();
       await acceptInvitation(carol,roomName);
       await openMembers(carol);
@@ -370,11 +367,10 @@ test('three humans review group invitations, transfer authority and remove acces
       await expect(button(carol,'批准邀请')).toHaveCount(0);
       await expect(button(carol,'发布公告')).toHaveCount(0);
 
-      await phase('publish announcement and promote admin',async ()=>{
-
     });
 
-    await alice.getByLabel('公告内容',{exact:true}).fill('周五晚冻结接口。');
+    await phase('publish announcement and promote admin',async ()=>{
+      await alice.getByLabel('公告内容',{exact:true}).fill('周五晚冻结接口。');
       await button(alice,'发布公告').click();
       await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toBeVisible();
       await person(alice,'Bob').getByRole('button',{name:'设为管理员',exact:true}).click();
@@ -382,21 +378,19 @@ test('three humans review group invitations, transfer authority and remove acces
       await expect(person(bob,'Alice').getByRole('button',{name:'移出群聊',exact:true})).toHaveCount(0);
       await expect(person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true})).toBeVisible();
 
-      await phase('transfer ownership',async ()=>{
-
     });
 
-    await person(alice,'Bob').getByRole('button',{name:'转让群主',exact:true}).click();
+    await phase('transfer ownership',async ()=>{
+      await person(alice,'Bob').getByRole('button',{name:'转让群主',exact:true}).click();
       await button(alice,'确认转让').click();
       await expect(person(bob,'Bob').getByText('群主',{exact:true})).toBeVisible();
       await expect(person(alice,'Alice').getByText('成员',{exact:true})).toBeVisible();
       await expect(alice.getByRole('button',{name:'设为管理员',exact:true})).toHaveCount(0);
 
-      await phase('remove member and verify live access updates',async ()=>{
-
     });
 
-    await person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true}).click();
+    await phase('remove member and verify live access updates',async ()=>{
+      await person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true}).click();
       await button(bob,'确认移出').click();
       await expect(button(carol,roomName)).toHaveCount(0);
       await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toHaveCount(0);
