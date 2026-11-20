@@ -284,13 +284,23 @@ test('humans confirm friendship, exchange private messages and catch up across u
 });
 
 test('three humans review group invitations, transfer authority and remove access', async () => {
-  const {origin,ownerKey,stop} = await launch();
+  async function phase(label, body) {
+    console.info('group IM: '+label);
+    return await test.step(label,body);
+  }
+  const {origin,ownerKey,stop} = await phase('start split application',launch);
   let browser;
   try {
-    browser = await chromium.launch({executablePath:process.env.AGENTCHAT_CHROMIUM||undefined});
-    const [alice,bob,carol] = await Promise.all([1,2,3].map(async () => (await browser.newContext()).newPage()));
+    browser = await phase('start Chromium',()=>chromium.launch({
+      executablePath:process.env.AGENTCHAT_CHROMIUM||undefined,timeout:9000,
+    }));
+    const [alice,bob,carol] = await phase('open three independent sessions',()=>Promise.all([1,2,3].map(async () => {
+      const context=await browser.newContext();
+      context.setDefaultTimeout(6000);
+      return context.newPage();
+    })));
     const api = async (page,path,data) => {
-      const response = data===undefined ? await page.request.get(origin+path) : await page.request.post(origin+path,{data});
+      const response = data===undefined ? await page.request.get(origin+path,{timeout:5000}) : await page.request.post(origin+path,{data,timeout:5000});
       expect(response.ok(), path+' HTTP '+response.status()).toBe(true);
       return response.json();
     };
@@ -304,71 +314,99 @@ test('three humans review group invitations, transfer authority and remove acces
     const acceptInvitation = async (page, name) => {
       await button(page,'群聊邀请').click();
       await page.getByRole('listitem').filter({hasText:name}).getByRole('button',{name:'接受群聊邀请',exact:true}).click();
-      await button(page,name).click();
       await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
+      await expect(button(page,'群聊邀请')).toHaveAttribute('aria-expanded','false');
     };
     const roomName = '蓝图讨论组';
 
-    await login(alice,origin,ownerKey);
-    const {human:bobIdentity,token:bobToken} = await api(alice,'/api/humans',{name:'Bob'});
-    const {human:carolIdentity,token:carolToken} = await api(alice,'/api/humans',{name:'Carol'});
-    await login(bob,origin,bobToken);
-    await login(carol,origin,carolToken);
-    await api(alice,'/api/contacts/request',{humanId:bobIdentity.id});
-    await api(bob,'/api/contacts/accept',{humanId:'owner'});
-    await api(bob,'/api/contacts/request',{humanId:carolIdentity.id});
-    await api(carol,'/api/contacts/accept',{humanId:bobIdentity.id});
+    await phase('provision users and confirmed friendships',async ()=>{
+      await login(alice,origin,ownerKey);
+      const {human:bobIdentity,token:bobToken} = await api(alice,'/api/humans',{name:'Bob'});
+      const {human:carolIdentity,token:carolToken} = await api(alice,'/api/humans',{name:'Carol'});
+      await login(bob,origin,bobToken);
+      await login(carol,origin,carolToken);
+      await api(alice,'/api/contacts/request',{humanId:bobIdentity.id});
+      await api(bob,'/api/contacts/accept',{humanId:'owner'});
+      await api(bob,'/api/contacts/request',{humanId:carolIdentity.id});
+      await api(carol,'/api/contacts/accept',{humanId:bobIdentity.id});
+
+      await phase('create room and accept initial invitation',async ()=>{
+
+    });
 
     await button(alice,'新建群聊').click();
-    await alice.getByLabel('群聊名称',{exact:true}).fill(roomName);
-    await alice.getByRole('checkbox',{name:'Bob',exact:true}).check();
-    await button(alice,'创建').click();
-    await expect(alice.getByRole('heading',{name:roomName,exact:true})).toBeVisible();
-    const managedRoom = (await api(alice,'/api/rooms')).rooms.find(room=>room.name===roomName);
-    expect(managedRoom?.managed).toBe(true);
-    await expect(button(bob,roomName)).toHaveCount(0);
-    await acceptInvitation(bob,roomName);
+      await alice.getByLabel('群聊名称',{exact:true}).fill(roomName);
+      await alice.getByRole('checkbox',{name:'Bob',exact:true}).check();
+      await button(alice,'创建').click();
+      await expect(alice.getByRole('heading',{name:roomName,exact:true})).toBeVisible();
+      const managedRoom = (await api(alice,'/api/rooms')).rooms.find(room=>room.name===roomName);
+      expect(managedRoom?.managed).toBe(true);
+      await expect(button(bob,roomName)).toHaveCount(0);
+      await acceptInvitation(bob,roomName);
+
+      await phase('regular member submits reviewed invitation',async ()=>{
+
+    });
 
     await openMembers(bob);
-    await expect(person(bob,'Bob').getByText('成员',{exact:true})).toBeVisible();
-    await button(bob,'邀请好友').click();
-    await bob.getByLabel('选择好友',{exact:true}).selectOption({label:'Carol'});
-    await button(bob,'发送邀请').click();
-    await button(carol,'群聊邀请').click();
-    await expect(button(carol,'接受群聊邀请')).toHaveCount(0);
-    await button(carol,'群聊邀请').click();
-    await expect(button(carol,roomName)).toHaveCount(0);
+      await expect(person(bob,'Bob').getByText('成员',{exact:true})).toBeVisible();
+      await button(bob,'邀请好友').click();
+      await bob.getByLabel('选择好友',{exact:true}).selectOption({label:'Carol'});
+      await button(bob,'发送邀请').click();
+      await button(carol,'群聊邀请').click();
+      await expect(button(carol,'接受群聊邀请')).toHaveCount(0);
+      await button(carol,'群聊邀请').click();
+      await expect(button(carol,roomName)).toHaveCount(0);
+
+      await phase('owner approves and guest accepts',async ()=>{
+
+    });
 
     await openMembers(alice);
-    await alice.getByRole('listitem').filter({hasText:/Bob.*Carol/}).getByRole('button',{name:'批准邀请',exact:true}).click();
-    await acceptInvitation(carol,roomName);
-    await openMembers(carol);
-    await expect(person(carol,'Carol').getByText('成员',{exact:true})).toBeVisible();
-    await expect(button(carol,'批准邀请')).toHaveCount(0);
-    await expect(button(carol,'发布公告')).toHaveCount(0);
+      await alice.getByRole('listitem').filter({hasText:/Bob.*Carol/}).getByRole('button',{name:'批准邀请',exact:true}).click();
+      await acceptInvitation(carol,roomName);
+      await openMembers(carol);
+      await expect(person(carol,'Carol').getByText('成员',{exact:true})).toBeVisible();
+      await expect(button(carol,'批准邀请')).toHaveCount(0);
+      await expect(button(carol,'发布公告')).toHaveCount(0);
+
+      await phase('publish announcement and promote admin',async ()=>{
+
+    });
 
     await alice.getByLabel('公告内容',{exact:true}).fill('周五晚冻结接口。');
-    await button(alice,'发布公告').click();
-    await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toBeVisible();
-    await person(alice,'Bob').getByRole('button',{name:'设为管理员',exact:true}).click();
-    await expect(person(bob,'Bob').getByText('管理员',{exact:true})).toBeVisible();
-    await expect(person(bob,'Alice').getByRole('button',{name:'移出群聊',exact:true})).toHaveCount(0);
-    await expect(person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true})).toBeVisible();
+      await button(alice,'发布公告').click();
+      await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toBeVisible();
+      await person(alice,'Bob').getByRole('button',{name:'设为管理员',exact:true}).click();
+      await expect(person(bob,'Bob').getByText('管理员',{exact:true})).toBeVisible();
+      await expect(person(bob,'Alice').getByRole('button',{name:'移出群聊',exact:true})).toHaveCount(0);
+      await expect(person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true})).toBeVisible();
+
+      await phase('transfer ownership',async ()=>{
+
+    });
 
     await person(alice,'Bob').getByRole('button',{name:'转让群主',exact:true}).click();
-    await button(alice,'确认转让').click();
-    await expect(person(bob,'Bob').getByText('群主',{exact:true})).toBeVisible();
-    await expect(person(alice,'Alice').getByText('成员',{exact:true})).toBeVisible();
-    await expect(alice.getByRole('button',{name:'设为管理员',exact:true})).toHaveCount(0);
+      await button(alice,'确认转让').click();
+      await expect(person(bob,'Bob').getByText('群主',{exact:true})).toBeVisible();
+      await expect(person(alice,'Alice').getByText('成员',{exact:true})).toBeVisible();
+      await expect(alice.getByRole('button',{name:'设为管理员',exact:true})).toHaveCount(0);
+
+      await phase('remove member and verify live access updates',async ()=>{
+
+    });
 
     await person(bob,'Carol').getByRole('button',{name:'移出群聊',exact:true}).click();
-    await button(bob,'确认移出').click();
-    await expect(button(carol,roomName)).toHaveCount(0);
-    await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toHaveCount(0);
-    await expect(carol.getByRole('heading',{name:'General',exact:true})).toBeVisible();
-    await send(bob,'交接完成，继续讨论。');
-    await expect(alice.locator('.message .body').getByText('交接完成，继续讨论。',{exact:true})).toBeVisible();
+      await button(bob,'确认移出').click();
+      await expect(button(carol,roomName)).toHaveCount(0);
+      await expect(carol.getByText('周五晚冻结接口。',{exact:true})).toHaveCount(0);
+      await expect(carol.getByRole('heading',{name:'General',exact:true})).toBeVisible();
+      await send(bob,'交接完成，继续讨论。');
+      await expect(alice.locator('.message .body').getByText('交接完成，继续讨论。',{exact:true})).toBeVisible();
+    });
+
   } finally {
-    try { await browser?.close(); } finally { await stop(); }
+    try { await phase('close Chromium',()=>browser?.close()); }
+    finally { await phase('stop split application',stop); }
   }
 });
