@@ -26,3 +26,15 @@ npm --prefix e2e test
 ```
 
 浏览器测试启动不同端口的前端、API/WebSocket 服务和临时私有存储。通过网页创建第二个真人账号，不用两个标签页复用 owner 身份；观察真实 WebSocket 帧后验证对端 UI，并实测重连补齐。录音在 Chromium 使用测试音频设备，不代表真机麦克风或实时通话。浏览器下载内容逐字节校验。存储自身另有构建和 Linux/Windows CI。
+
+- `node --test test/deploy-desktop.test.mjs test/deploy-lifecycle.test.mjs`:
+  real child-process and loopback checks for the supervisor. The split runtime
+  fixture uses verified local dependencies and simulated Git/GitHub transport,
+  not a user device or deployment account. It includes a gateway with working
+  HTTP readiness but no WebSocket upgrade and proves that the previous
+  release and data are untouched. The Playwright media matrix stays separate.
+  Windows CI additionally rehearses the real frozen production npm install,
+  confirms the installed WebSocket version equals the lockfile and tests
+  the supervisor with real split processes. Windows PowerShell 5.1 checks
+  a stand-alone Node rejection and validation of the runner's bundled npm.
+  No hosted test writes a user runtime manifest or Scheduler task.

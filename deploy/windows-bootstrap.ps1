@@ -60,21 +60,59 @@ function Find-Executable([string] $Name, [string] $Preferred) {
     return [string]$command.Source
 }
 
+function Assert-PlainRuntimeFile([string] $Path) {
+    if (![IO.Path]::IsPathRooted($Path) -or !(Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Required runtime file is not available.' }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Required runtime file is linked.' }
+}
+
+function Read-NodeDistribution([string] $NodePath, [string] $PinnedNpm = '') {
+    Assert-PlainRuntimeFile $NodePath
+    $nodePath = [IO.Path]::GetFullPath($NodePath)
+    if ([IO.Path]::GetFileName($nodePath) -ine 'node.exe') { throw 'Expected node.exe from a complete Node installation.' }
+    $npm = Join-Path ([IO.Path]::GetDirectoryName($nodePath)) 'node_modules\npm\bin\npm-cli.js'
+    try { Assert-PlainRuntimeFile $npm } catch { throw 'Node 24 or later with bundled npm is required.' }
+    if ($PinnedNpm -and (![IO.Path]::IsPathRooted($PinnedNpm) -or [IO.Path]::GetFullPath($PinnedNpm) -ine $npm)) {
+        throw 'The pinned bundled npm does not match the Node distribution.'
+    }
+    $priorOptions = $env:NODE_OPTIONS
+    $priorNodePath = $env:NODE_PATH
+    try {
+        $env:NODE_OPTIONS = $null
+        $env:NODE_PATH = $null
+        $version = & $nodePath --version
+        if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v(\d+)\.\d+\.\d+$' -or [int]$Matches[1] -lt 24) { throw 'Node 24 or later with bundled npm is required.' }
+        $major = [int]$Matches[1]
+        $npmVersion = & $nodePath $npm --version
+        if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'The bundled npm could not start with the selected Node executable.' }
+        return [pscustomobject]@{ node = $nodePath; npm = $npm; nodeMajor = $major; npmVersion = $npmVersion }
+    } finally {
+        $env:NODE_OPTIONS = $priorOptions
+        $env:NODE_PATH = $priorNodePath
+    }
+}
+
+function Find-NodeDistribution([string] $Preferred, [string[]] $Candidates) {
+    foreach ($candidate in (@($Preferred) + $Candidates | Where-Object { $_ } | Select-Object -Unique)) {
+        try { return Read-NodeDistribution $candidate } catch { }
+    }
+    throw 'Install an official Node.js 24 or later distribution with bundled npm; standalone or shim node.exe is not sufficient.'
+}
+
 function Read-InstallPrerequisites {
-    $node = Find-Executable 'node.exe' (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    $preferred = Join-Path $env:ProgramFiles 'nodejs\node.exe'
+    $candidates = @(Get-Command -Name 'node.exe' -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.Source })
+    $runtime = Find-NodeDistribution $preferred $candidates
     $git = Find-Executable 'git.exe' (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')
-    $version = & $node --version
-    if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v(\d+)\.\d+\.\d+' -or [int]$Matches[1] -lt 24) { throw 'Install official Node.js 24 or later first.' }
-    $major = [int]$Matches[1]
     [void](Get-Command Register-ScheduledTask -ErrorAction Stop)
-    return [pscustomobject]@{ node = $node; git = $git; nodeMajor = [int]$major }
+    return [pscustomobject]@{ node = $runtime.node; npm = $runtime.npm; git = $git; nodeMajor = $runtime.nodeMajor; npmVersion = $runtime.npmVersion }
 }
 
 Assert-SafeDirectory $workspaceDir
 Assert-SafeDirectory $bootstrapDir
 if ($Mode -eq 'Check') {
     $runtime = Read-InstallPrerequisites
-    [pscustomobject]@{ nodeMajor = $runtime.nodeMajor; preferredNode = ($runtime.node -ieq (Join-Path $env:ProgramFiles 'nodejs\node.exe')); preferredGit = ($runtime.git -ieq (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')); taskCmdletsAvailable = $true; persisted = 'none' } | ConvertTo-Json -Compress
+    [pscustomobject]@{ nodeMajor = $runtime.nodeMajor; preferredNode = ($runtime.node -ieq (Join-Path $env:ProgramFiles 'nodejs\node.exe')); preferredGit = ($runtime.git -ieq (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')); npmValidated = [bool]$runtime.npmVersion; taskCmdletsAvailable = $true; persisted = 'none' } | ConvertTo-Json -Compress
     return
 }
 if ($Mode -eq 'Install') {
@@ -127,11 +165,17 @@ if ($Mode -eq 'Run') {
     $runtimeItem = Get-Item -LiteralPath $runtimeFile -Force
     if ($runtimeItem.PSIsContainer -or ($runtimeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $runtimeItem.Length -gt 4096) { throw 'Pinned executable manifest is invalid.' }
     $runtime = [IO.File]::ReadAllText($runtimeFile) | ConvertFrom-Json
-    foreach ($binary in @{ node = $runtime.node; git = $runtime.git }.GetEnumerator()) {
+    if (!$runtime.PSObject.Properties['npm'] -or !$runtime.npm) { throw 'Pinned bundled npm is missing. Update the reviewed bootstrap and runtime manifest together.' }
+    $nodeRuntime = Read-NodeDistribution $runtime.node $runtime.npm
+    foreach ($binary in @{ git = $runtime.git }.GetEnumerator()) {
         if (![IO.Path]::IsPathRooted($binary.Value) -or [IO.Path]::GetFileName($binary.Value) -ine ($binary.Key + '.exe') -or !(Test-Path -LiteralPath $binary.Value -PathType Leaf)) { throw 'A pinned executable is not available.' }
     }
     $bytes = Read-LocalOwnerBytes
+    $priorOptions = $env:NODE_OPTIONS
+    $priorNodePath = $env:NODE_PATH
     try {
+        $env:NODE_OPTIONS = $null
+        $env:NODE_PATH = $null
         $env:WORKSPACE_TOKEN = Convert-ToLocalToken $bytes
         $env:WORKSPACE_CD_ROOT = $workspaceDir
         $env:WORKSPACE_REPOSITORY = $repo
@@ -140,10 +184,12 @@ if ($Mode -eq 'Run') {
         $env:WORKSPACE_GIT_EXE = $runtime.git
         $env:WORKSPACE_SECURE_COOKIES = '0'
         $env:WORKSPACE_PUBLIC_ORIGIN = $null
-        & $runtime.node $desktopSupervisor
+        & $nodeRuntime.node $desktopSupervisor
         $code = $LASTEXITCODE
     } finally {
         $env:WORKSPACE_TOKEN = $null
+        $env:NODE_OPTIONS = $priorOptions
+        $env:NODE_PATH = $priorNodePath
         [Array]::Clear($bytes, 0, $bytes.Length)
     }
     exit $code

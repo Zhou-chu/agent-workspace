@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -146,4 +146,114 @@ test('unexpected response types from public CI fail closed and prevent candidate
     if (first) { first = false; return Response.json({ object: {type:'commit', sha: NEW} }); }
     return Response.json({ error:'malformed' });
   }), /Invalid CI result/);
+});
+
+async function installFixtureRelease(host, installForReal = false) {
+  const source = target => new URL(target, new URL('../', import.meta.url));
+  const release = join(host.root, 'releases', NEW);
+  await writeRelease(release, NEW);
+  await Promise.all(['server','frontend','storage'].map(name => cp(source(name), join(release,name), {recursive:true})));
+  await Promise.all(['package.json','package-lock.json'].map(name => cp(source(name), join(release,name))));
+  const installations = [];
+  if (!installForReal) host.options.installRuntime = async cwd => {
+    installations.push(cwd);
+    const modules = join(cwd,'node_modules');
+    await mkdir(modules);
+    await cp(source('node_modules/ws'),join(modules,'ws'),{recursive:true,dereference:true});
+  };
+  return {release, installations};
+}
+
+test('supervisor activates the built AgentChat gateway and real IM API on separate loopback ports', {timeout:150_000}, async t => {
+  const host = await makeHost(t);
+  const installForReal = process.env.AGENTCHAT_REHEARSE_NPM==='1';
+  const {release, installations} = await installFixtureRelease(host,installForReal);
+  host.options.pause = async () => {
+    const origin = `http://127.0.0.1:${host.config.port}`;
+    const [html, session] = await Promise.all([
+      fetch(origin + '/').then(r => r.text()),
+      fetch(origin + '/api/session', {headers:{Authorization:`Bearer ${host.config.token}`}})
+        .then(r => r.json()).catch(() => null),
+    ]);
+    host.live = {page:html.includes('AgentChat'), rt:session?.imRealtime};
+    host.active = await host.inspect();
+    host.controller.abort();
+  };
+  await supervise(host.config, host.controller.signal, host.options);
+  assert.deepEqual(host.live,{page:true, rt:true});
+  assert.deepEqual(host.active, {active: current(NEW), previous: null});
+  assert.deepEqual(installations,installForReal ? [] : [release]);
+  const installed = JSON.parse(await readFile(join(release,'node_modules','ws','package.json'),'utf8'));
+  const locked = JSON.parse(await readFile(join(release,'package-lock.json'),'utf8'));
+  assert.equal(installed.version,locked.packages['node_modules/ws'].version);
+  if (installForReal) await assert.rejects(readFile(join(release,'node_modules','dependency-cruiser','package.json')), {code:'ENOENT'});
+  await assert.rejects(host.health());
+});
+
+test('a health-green split candidate without WebSocket forwarding cannot replace the previous live release', {timeout:20_000}, async t => {
+  const host = await makeHost(t);
+  const prior = await seedActive(host.root);
+  const {release} = await installFixtureRelease(host);
+  const gatewayFile = join(release,'frontend','gateway','index.mjs');
+  const original = await readFile(gatewayFile,'utf8');
+  const upgrade = "  server.on('upgrade',(req,socket,head)=>forwardUpgrade(req,socket,head,backend));";
+  assert.ok(original.includes(upgrade));
+  await writeFile(gatewayFile,original.replace(upgrade,''));
+  host.options.pause = async () => { host.priorCheck = await host.health(); host.controller.abort(); };
+  await supervise(host.config,host.controller.signal,host.options);
+  assert.deepEqual(host.priorCheck,{ok:true, production:true});
+  assert.deepEqual(await host.inspect(),{active:prior, previous:null});
+  assert.deepEqual(await readdir(join(host.root,'backups')),[]);
+  assert.deepEqual(host.logs,[]);
+  assert.equal(host.errors.length,1);
+});
+
+test('a legacy release with a frontend build but no modern entrypoint still starts without installing npm packages', async t => {
+  const host = await makeHost(t);
+  const prior = await seedActive(host.root);
+  const frontend = join(host.root,'releases',OLD,'frontend');
+  await mkdir(frontend);
+  await writeFile(join(frontend,'build.mjs'),"throw Error('legacy frontend build must not run');");
+  let installed = 0;
+  host.options.installRuntime = async () => { installed++; throw Error('legacy runtime install must not run'); };
+  host.options.fetcher = async () => Response.json({ object:{type:'commit',sha:OLD} });
+  host.options.pause = async () => { host.observed = await host.health(); host.controller.abort(); };
+  await supervise(host.config,host.controller.signal,host.options);
+  assert.deepEqual(host.observed,{ok:true,production:true});
+  assert.deepEqual(await host.inspect(),{active:prior,previous:null});
+  assert.equal(installed,0);
+});
+
+test('a partial split release is rejected before installing or launching either entrypoint', async t => {
+  const host = await makeHost(t);
+  const prior = await seedActive(host.root);
+  const release = join(host.root,'releases',NEW);
+  await writeRelease(release,NEW);
+  await writeFile(join(release,'server','api.mjs'),"throw Error('incomplete API must not launch');");
+  const frontend = join(release,'frontend');
+  await mkdir(frontend);
+  await writeFile(join(frontend,'build.mjs'),"throw Error('partial frontend build must not run');");
+  let installed = 0;
+  host.options.installRuntime = async () => { installed++; };
+  host.options.pause = async () => { host.observed = await host.health(); host.controller.abort(); };
+  await supervise(host.config,host.controller.signal,host.options);
+  assert.deepEqual(host.observed,{ok:true,production:true});
+  assert.deepEqual(await host.inspect(),{active:prior,previous:null});
+  assert.deepEqual(await readdir(join(host.root,'backups')),[]);
+  assert.equal(installed,0);
+  assert.equal(host.errors.length,1);
+  assert.deepEqual(host.logs,[]);
+});
+
+test('a modern release cannot override the isolated npm installation configuration', async t => {
+  const host = await makeHost(t);
+  const prior = await seedActive(host.root);
+  const {release,installations} = await installFixtureRelease(host);
+  await writeFile(join(release,'.npmrc'),'fund=false\n');
+  host.options.pause = async () => { host.observed=await host.health(); host.controller.abort(); };
+  await supervise(host.config,host.controller.signal,host.options);
+  assert.deepEqual(host.observed,{ok:true,production:true});
+  assert.deepEqual(await host.inspect(),{active:prior,previous:null});
+  assert.deepEqual(installations,[]);
+  assert.equal(host.errors.length,1);
 });
