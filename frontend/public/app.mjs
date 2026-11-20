@@ -805,7 +805,7 @@ async function chatPage(target, epoch) {
     chat.append(conversation);
     paintMentions(); paintReply();
     refresh(true);
-    if(!direct) refreshMembers();
+    if (!direct) void refreshMembers();
     state.tick = () => refresh();
     state.sync = () => {acknowledgeRead();return refresh(true,true);};
   }
