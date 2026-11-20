@@ -1,14 +1,51 @@
 # Testing and hosted quality checks
 
-- `npm run check:architecture` checks the static JavaScript module graph once per CI run on Linux. `web/`, `server/`, `connector/` and `deploy/` may import only their own local modules; their integration uses the existing HTTP and process protocols. Browser modules cannot import Node built-ins, and production runtimes cannot import npm packages. Unresolved imports and cycles fail CI. There is no exception baseline. The gate does not analyze PowerShell/HTML or computed module specifiers. The `test/architecture-gate.test.mjs` fixtures prove the CLI accepts valid edges and exits nonzero on violations.
+- `npm run check:architecture` checks browser, frontend gateway, server, connector, deployment and storage runtime boundaries. Their public interfaces are HTTP/process protocols or the exact storage adapter entry. Node built-ins are not allowed in browser code; only the WebSocket transport may import its exact locked runtime package. Unresolved imports and cycles fail CI.
+- `node --test test/api-session-bindings.test.mjs`: owner-only operator lifecycle, cross-origin denial, stale-write rejection, immutable replay inspection and zero host dispatch.
 
+- `node --test test/core-session-bindings.test.mjs`: exact task/default selection, no implicit or untrusted peer routing, authorization/revocation, exclusive session scope, generation and stale CAS, legacy migration, durable receipt replay. SQLite selection evidence is not native execution.
 - `node --test test/core-workspace.test.mjs test/api-workspace.test.mjs`: persistence, identity, room scope, alerts vs passive chat, idempotency, trusted decisions and lifecycle transitions.
 - `node --test test/mcp-chat.test.mjs test/api-task-artifacts.test.mjs test/ui-integration.test.mjs`: chat and explicit decision MCP semantics, task artifact authorization, immutable downloads, and lost-response retry. Local fixtures are not real model turns or remote artifact transfers.
 - `node --test test/connector-status.test.mjs`: host heartbeat and approved status-only action, recovery from a lost receipt, token revocation. No models or arbitrary execution.
-- `node --test test/ui-contract.test.mjs`: UI message semantics and exact local payloads. These tests do not certify real browser/mobile rendering.
+- `cd frontend && npm ci --ignore-scripts && npm test && npm run build`: standalone UI contracts and exact static artifact; the separate **Frontend CI / Frontend build and tests** check needs no backend install. These tests do not certify real browser/mobile rendering.
 - `node --test test/deploy-desktop.test.mjs`: exact GitHub main/CI selection, loopback defaults and rollback-related configuration. Does not certify deployment.
-- `npm test`: release-candidate regression; GitHub CI runs it on Node 24 on Linux and Windows.
-- `mkdir -p coverage && npm run coverage`: generate LCOV for SonarQube Cloud. The scanner is a separate workflow with a waiting quality gate and cannot consume secrets for a fork pull request. Enable after the project is imported and configured: repository variable `SONAR_ENABLED=true`, repository secret `SONAR_TOKEN` scoped to this project, automatic analysis disabled if Workflows are used. An unconfigured, skipped workflow is not a passing Sonar quality gate.
+- `npm test`: backend and cross-module regression (including UI/HTTP/SQLite); GitHub CI runs it on Node 24 on Linux and Windows.
+- `mkdir -p coverage && npm run coverage`: generate combined frontend and backend LCOV for SonarQube Cloud. The scanner is a separate workflow with a waiting quality gate and cannot consume secrets for a fork pull request. Enable after the project is imported and configured: repository variable `SONAR_ENABLED=true`, repository secret `SONAR_TOKEN` scoped to this project, automatic analysis disabled if Workflows are used. An unconfigured, skipped workflow is not a passing Sonar quality gate.
 - The desktop deployer uses the exact successful main push run of `ci.yml`; it does not certify Sonar results. Runtime credentials, caches and data directories are outside releases.
 
 On main, the independent coverage reconciliation compares the exact Sonar revision and scanner's LCOV input. Missing or malformed individual metrics do not erase other verified measures; omissions are summarized using fixed metric names and reason codes, never raw response contents. If the analysis identity is not stable, only the verified hosted LCOV fallback is shown. The diagnostic does not override the scanner's quality gate.
+
+真人 IM 首轮（Node 24，两个独立浏览器上下文）：
+
+```sh
+npm ci --ignore-scripts
+npm --prefix frontend run build
+npm --prefix e2e ci --ignore-scripts
+npx --prefix e2e --no-install playwright install --with-deps chromium
+npm --prefix e2e test
+```
+
+浏览器测试启动不同端口的前端、API/WebSocket 服务和临时私有存储。通过网页创建第二个真人账号，不用两个标签页复用 owner 身份；观察真实 WebSocket 帧后验证对端 UI，并实测重连补齐。录音在 Chromium 使用测试音频设备，不代表真机麦克风或实时通话。浏览器下载内容逐字节校验。存储自身另有构建和 Linux/Windows CI。
+
+- `node --test test/deploy-desktop.test.mjs test/deploy-lifecycle.test.mjs`:
+  real child-process and loopback checks for the supervisor. The split runtime
+  fixture uses verified local dependencies and simulated Git/GitHub transport,
+  not a user device or deployment account. It includes a gateway with working
+  HTTP readiness but no WebSocket upgrade and proves that the previous
+  release and data are untouched. The Playwright media matrix stays separate.
+  Windows CI additionally rehearses the real frozen production npm install,
+  confirms the installed WebSocket version equals the lockfile and tests
+  the supervisor with real split processes. Windows PowerShell 5.1 checks
+  a stand-alone Node rejection and validation of the runner's bundled npm.
+  No hosted test writes a user runtime manifest or Scheduler task.
+
+## 好友、私聊与离线未读
+
+- `node --test test/core-im-contacts.test.mjs test/api-im-contacts.test.mjs`：互相确认、固定双人范围、普通会话与 Agent 游标隔离、持久未读、仅定向发送刷新提示。
+- `npm --prefix frontend test`：分页游标推进、去重、状态过期处理和已读条件。
+- `npm --prefix e2e test`：保留原真人群聊媒体场景；新增两会话验证，覆盖双人确认、私聊收发、在 General 不清除私聊未读、断线期间 124 条跨页消息及一条旧消息撤回。新增场景的真实 Chromium 结果以对应 CI 为准，不等同于真实终端/Tailnet/延迟验收。
+
+## 真人管理群
+
+- `node --test test/core-im-groups.test.mjs test/api-im-groups.test.mjs`：两段确认、当前角色、转让／移除／离开、公告、重启持久化、旧路由与私聊边界、实时成员撤销。
+- Playwright 第三场景用三个独立浏览器会话覆盖：创建和邀友、普通成员提请审核、受邀人接受、公告可见、管理员权限边界、群主转让、第三位成员被移出后的页面撤销。实际结果以对应 CI 为准。

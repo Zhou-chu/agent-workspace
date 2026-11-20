@@ -1,0 +1,54 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createWorkspaceServer } from '../server/index.mjs';
+import { openWorkspace } from '../server/workspace.mjs';
+
+test('owner binding operations are scoped, stale-safe and leave immutable non-executing receipts', async t => {
+  const store=openWorkspace(':memory:');
+  const ownerToken='owner-test-token-at-least-32-characters';
+  const {agent,token:agentToken}=store.createAgent(store.owner,{name:'Alpha'});
+  const {host,token:hostToken}=store.hosts.register(store.owner,{name:'Fixture host'});
+  const server=createWorkspaceServer({store,ownerToken});
+  server.listen(0,'127.0.0.1');
+  await once(server,'listening');
+  t.after(async()=>{await new Promise(resolve=>server.close(resolve));store.close();});
+  const origin='http://127.0.0.1:'+server.address().port;
+  const post=(path,input,headers)=>fetch(origin+path,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(input)});
+  const login=await post('/api/login',{token:ownerToken},{origin});
+  const owner={cookie:login.headers.get('set-cookie').split(';')[0],origin};
+  const scope={roomId:'general',agentId:agent.id};
+  const registration={...scope,expectedBindingId:null,hostId:host.id,harness:'codex',sessionId:'synthetic-native',generation:1};
+  const call=(op,input,headers=owner)=>post('/api/operator/session-bindings/'+op,input,headers);
+  for (const op of ['inspect','set','retire','receipt']) {
+    assert.equal((await call(op,{},{})).status,401);
+    assert.equal((await call(op,{}, {Authorization:'Bearer '+hostToken})).status,401);
+    assert.equal((await call(op,{}, {Authorization:'Bearer '+agentToken})).status,403);
+    assert.equal((await call(op,{}, {...owner,origin:'https://example.org'})).status,403);
+  }
+  assert.deepEqual(await (await call('inspect',scope)).json(),{binding:null});
+  assert.equal((await call('inspect',{...scope,roomId:'missing'})).status,404);
+  assert.equal((await call('set',{...registration,dispatch:true})).status,400);
+  const first=await call('set',registration);
+  assert.equal(first.status,201);
+  const {binding}=await first.json();
+  assert.deepEqual(await (await call('inspect',scope)).json(),{binding});
+  assert.equal((await call('set',registration)).status,409);
+  const messagePath='/api/rooms/general/messages';
+  const payload={clientRequestId:'stable-key',body:'request',mentions:[agent.id]};
+  const sent=await (await post(messagePath,payload,owner)).json();
+  const query={...scope,messageId:sent.message.id};
+  const successor=await call('set',{...registration,generation:2,expectedBindingId:binding.id});
+  assert.equal(successor.status,201);
+  const next=(await successor.json()).binding;
+  assert.equal((await call('retire',{...scope,expectedBindingId:binding.id})).status,409);
+  assert.deepEqual(await (await post(messagePath,payload,owner)).json(),sent);
+  assert.deepEqual(await (await call('receipt',query)).json(),{receipt:{status:'selected_not_dispatched',bindingId:binding.id,generation:1}});
+  assert.deepEqual(await (await call('retire',{...scope,expectedBindingId:next.id})).json(),{binding:{id:next.id,status:'retired'}});
+  assert.deepEqual(await (await call('inspect',scope)).json(),{binding:null});
+  assert.equal((await call('retire',{...scope,expectedBindingId:next.id})).status,409);
+  const {message}=await (await post(messagePath,{...payload,clientRequestId:'plain',mentions:[]},owner)).json();
+  assert.deepEqual(await (await call('receipt',{...scope,messageId:message.id})).json(),{receipt:null});
+  store.hosts.heartbeat(store.hosts.authenticate(hostToken),{});
+  assert.equal(store.hosts.claim(store.hosts.authenticate(hostToken),{requestId:'no-dispatch'}),null);
+});

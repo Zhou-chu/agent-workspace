@@ -1,21 +1,29 @@
-# Agent Workspace
+# AgentChat
 
 群聊式开发工作台。代码仓库公开，运行实例默认只监听本机，不开放公网。
 
 ## 本地运行
 
-需要 Node.js 24。通过本机安全配置注入至少 32 个字符的 `WORKSPACE_TOKEN`，不要提交凭据。可通过 `WORKSPACE_DATA_DIR` 选择持久目录；默认只监听 127.0.0.1:4319。
+需要 Node.js 24。前端与后端用两个独立进程运行：
 
 ```sh
-npm test
-npm start
+npm ci --ignore-scripts
+# 先从本机私密配置向环境注入 WORKSPACE_TOKEN
+WORKSPACE_PUBLIC_ORIGIN=http://127.0.0.1:4320 npm start
+# 在另一个终端运行
+npm --prefix frontend ci --ignore-scripts
+npm --prefix frontend run build
+AGENTCHAT_FRONTEND_PORT=4320 AGENTCHAT_BACKEND_ORIGIN=http://127.0.0.1:4319 npm --prefix frontend start
 ```
 
-访问 http://127.0.0.1:4319/。首次进入用本机配置的令牌登录。普通消息写入群历史；从成员列表选定明确的 @ 才登记提醒。产生提醒不等于已启动真实 Agent。
+后端端口 4319 只提供 API、WebSocket 和健康检查，不提供静态页面。前端端口 4320 只提供独立构建产物，并把同源的 API/WebSocket 转给指定后端。访问前端地址，用本机配置密钥登录；owner 可在设置中生成另一位真人的独立登录密钥。
 
+- [真人 IM、浏览器验收与实施顺序](docs/IM-BASELINE.md)
+- [独立前端](frontend/README.md)
+- [独立存储](storage/README.md)
 - [功能、范围与验收](Features.md)
 - [交付阶段与当前边界](docs/IMPLEMENTATION.md)
 - [测试和质量门禁](docs/TESTING.md)
 - [台式机部署](docs/DEPLOYMENT.md)
 
-Windows 原生 Codex 已在隔离测试空间验证 MCP 被动读取和普通发送，不代表模型唤醒或双 Agent 协作通过。项目与任务中可添加和下载授权的纯文本产物；Agent 可显式请求 owner 决策。外部设备、跨主机执行和原生审批仍未验收。运行数据、浏览器登录和模型凭据不属于此仓库。
+当前顺序是真人 IM、再接入 Agent、再验证智能编排。旧试验入口不等于当前产品已接入 Harness。运行数据、浏览器登录和模型凭据不属于此仓库。

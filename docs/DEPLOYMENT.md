@@ -1,4 +1,4 @@
-# Agent Workspace desktop delivery
+# AgentChat desktop delivery
 
 This is a pull deployer for a Windows account that owns the application. The
 GitHub-hosted CI runner has no access to the desktop or its secrets. This
@@ -134,3 +134,58 @@ powershell.exe -NoProfile -File .\test\deploy-bootstrap.test.ps1
 These deterministic tests validate trust selection, input validation,
 loopback-only configuration and activation/rollback ordering. They do not
 activate GitHub, publish data or demonstrate a real installation.
+
+### Split AgentChat runtime candidate
+
+For releases with both `server/api.mjs` and `frontend/gateway/index.mjs`, the
+updated supervisor prepares that exact checkout using its frozen production
+dependencies (the selected Node 24 installation must include npm; lifecycle
+scripts disabled) and the frontend build. It runs the gateway on the existing
+configured loopback port and the API on a distinct loopback port. The reverse
+proxy should continue to target the gateway, not the backend. An already
+installed copy of the old supervisor is **not** updated by fetching main.
+
+Before it stops the previous runtime, the supervisor launches a disposable
+copy of the same pair, loads built HTML, signs into the API through the
+gateway, and requires an authenticated WebSocket notification for a disposable
+message. The trial uses fresh data and a generated test key, not the real
+account's credential. The new live pair must also expose the built HTML and
+API through the gateway. It does not send test messages or authenticate as
+the owner against live data. Both owned children are stopped on failure or
+shutdown. Historical pre-split releases remain launchable by the new controller.
+
+The Windows installation and existing task are unchanged by these code/test
+changes. Hosted Windows process coverage, reviewed installation handoff,
+Tailnet origin, and real-device acceptance are distinct verification steps.
+
+The Windows bootstrap's `Check` and `Install` require a complete Node
+distribution. They validate `node.exe` and its adjacent bundled npm CLI
+together; `Check` reports `npmValidated` without editing the host. `Run`
+revalidates both pinned paths before reading the owner key. An older
+`runtime.json` lacks the npm pin; plan a reviewed handoff of the bootstrap,
+supervisor and manifest together **before** switching to a split release.
+Fetching main does not perform that migration or change the existing task
+and its local credential.
+
+The staged npm install uses the reviewed lockfile, public npm registry and
+temporary empty user/global configs and cache. It rejects a project
+`.npmrc` and does not read or edit the user's npm config. Package fetch must
+work on the target host; failure leaves the existing release alone during
+candidate smoke.
+
+The gateway's `/healthz` only means the gateway is responsive. For a
+non-secret end-to-end HTTP check also verify that `/api/session` at the
+same origin returns HTTP 401 with Content-Type application/json without
+credentials. The authenticated WebSocket trial is separately run against
+disposable data. The periodic controller checks child processes when it
+polls; it is not an immediate or continuous runtime liveness monitor.
+
+### Managed human group data and older releases
+
+Do not treat a pre-managed-group binary as a supported rollback once users
+are creating managed groups. The persistent table guards block old writes
+that directly alter managed membership, but an older frontend/backend does
+not implement role-aware invitations, announcements, or live removal UI.
+Use a forward fix, or an explicitly approved migration rollback with a
+verified snapshot and an accounting of writes made after that snapshot.
+This note does not authorize restoring or changing the desktop database.

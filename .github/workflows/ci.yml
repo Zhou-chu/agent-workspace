@@ -33,4 +33,12 @@ jobs:
       - name: Verify Windows bootstrap executable selection
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./test/deploy-bootstrap.test.ps1
+        run: |
+          & ./test/deploy-bootstrap.test.ps1
+          $checked = & ./deploy/windows-bootstrap.ps1 -Mode Check | ConvertFrom-Json
+          if (!$checked.npmValidated -or $checked.persisted -ne 'none') { throw 'Bootstrap read-only check did not validate bundled npm.' }
+      - name: Rehearse split Windows supervisor with frozen production dependencies
+        if: runner.os == 'Windows'
+        env:
+          AGENTCHAT_REHEARSE_NPM: '1'
+        run: node --test --test-name-pattern="supervisor activates the built" test/deploy-lifecycle.test.mjs

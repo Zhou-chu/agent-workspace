@@ -1,6 +1,6 @@
 import { spawn, execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -183,39 +183,158 @@ async function stopChild(child) {
   }
 }
 
-async function launch(config, releasePath, dataDir, port, token) {
-  await reserveLoopback(port);
-  const entry = join(releasePath, "server", "index.mjs");
-  const child = spawn(process.execPath, [entry], {
-    cwd: releasePath, env: serviceEnv(config, dataDir, port, token), windowsHide: true,
-    stdio: "ignore"
+function startChild(releasePath, entry, env) {
+  const child = spawn(process.execPath, [join(releasePath, entry)], {
+    cwd: releasePath, env, windowsHide: true, stdio: "ignore"
   });
-  let spawnError;
-  child.on("error", error => { spawnError = error; });
+  const service = { child, error: null };
+  child.on("error", error => { service.error = error; });
+  return service;
+}
+
+const healthy = services => Boolean(services?.length) && services.every(service => !service.error && !childExited(service.child));
+const stopServices = services => Promise.all((services ?? []).map(service => service.error ? null : stopChild(service.child)));
+
+async function waitForServices(services, probe) {
+  const expires = performance.now() + 18_000;
+  while (performance.now() < expires) {
+    if (!healthy(services)) throw new Error("Service process could not start");
+    if (await probe().catch(() => false) && healthy(services)) return;
+    await delay(220);
+  }
+  throw new Error("Service did not become healthy");
+}
+
+function localFetch(origin, path, options) {
+  return fetch(new URL(path, origin), { ...options, redirect:"error", signal:AbortSignal.timeout(1500) });
+}
+
+async function probeLive(origin, backend, token) {
+  const page = await localFetch(origin, "/");
+  const html = page.headers.get("content-type")?.startsWith("text/html");
+  await page.body?.cancel();
+  if (!page.ok || !html) return false;
+  const api = await localFetch(origin, "/api/session", token ? { headers:{ Authorization:`Bearer ${token}` } } : {});
+  const expectedApi = token
+    ? api.ok && (await api.json()).imRealtime === true
+    : api.status === 401 && api.headers.get("content-type")?.startsWith("application/json");
+  if (!api.bodyUsed) await api.body?.cancel();
+  if (!expectedApi) return false;
+  const raw = await localFetch(backend, "/");
+  await raw.body?.cancel();
+  return raw.status === 404;
+}
+
+async function probeDisposableChat(origin, token) {
+  const json = { "Content-Type":"application/json", Origin:origin };
+  const login = await localFetch(origin, "/api/login", {method:"POST", headers:json, body:JSON.stringify({token})});
+  const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
+  await login.body?.cancel();
+  if (!login.ok || !cookie) throw new Error("Gateway could not log in to the disposable IM account");
+  const wsUrl = new URL("/ws", origin);
+  wsUrl.protocol = "ws:";
+  // Node 24's native WebSocket uses Undici's options for local test headers.
+  const ws = new WebSocket(wsUrl, { headers:{Cookie:cookie, Origin:origin} });
+  let openTimer, frameTimer;
+  function waitEvent(type, setTimer) {
+    return new Promise((accept, reject) => {
+      const failed = () => reject(new Error("Disposable IM WebSocket did not complete " + type));
+      // A closed connection cannot pass readiness, even if logout cleans it up.
+      ws.addEventListener("error", failed, {once:true});
+      ws.addEventListener("close", failed, {once:true});
+      ws.addEventListener(type, accept, {once:true});
+      setTimer(setTimeout(failed, 2000));
+    });
+  }
   try {
-    const expires = performance.now() + 18_000;
-    while (performance.now() < expires) {
-      if (spawnError || childExited(child)) throw new Error("Service process could not start");
-      const result = await fetch(`http://${loopback}:${port}/healthz`, {
-        redirect: "error", signal: AbortSignal.timeout(1000)
-      }).catch(() => null);
-      if (result?.ok && !childExited(child)) {
-        await result.body?.cancel();
-        return child;
-      }
-      await result?.body?.cancel();
-      await delay(220);
+    await waitEvent("open", timer => {openTimer=timer;});
+    const frame = waitEvent("message", timer => {frameTimer=timer;});
+    // Observe failure eagerly even if the HTTP request fails first.
+    frame.catch(() => {});
+    const sent = await localFetch(origin, "/api/rooms/general/messages", {
+      method:"POST", headers:{...json,Cookie:cookie},
+      body:JSON.stringify({body:"AgentChat disposable readiness",clientRequestId:"deployment-ready"}),
+    });
+    await sent.body?.cancel();
+    if (sent.status!==201) throw new Error("Gateway could not send a disposable IM message");
+    const event = JSON.parse((await frame).data);
+    if (event.type!=="room.changed" || event.roomId!=="general") throw new Error("Gateway returned an unexpected disposable IM event");
+  } finally {
+    clearTimeout(openTimer);
+    clearTimeout(frameTimer);
+    ws.close();
+  }
+}
+
+async function installPinnedRuntime(releasePath) {
+  const npm = join(dirname(process.execPath), process.platform==="win32" ? "node_modules" : "../lib/node_modules", "npm", "bin", "npm-cli.js");
+  await access(npm).catch(() => {throw new Error("The selected Node installation must include npm");});
+  const configHome = await mkdtemp(join(tmpdir(), "agentchat-npm-config-"));
+  try {
+    // Suppress user/global npmrc even though the supported OS environment
+    // includes a home. The verified release may not supply a project npmrc.
+    const userconfig = join(configHome, "user.npmrc");
+    const globalconfig = join(configHome, "global.npmrc");
+    await Promise.all([userconfig,globalconfig].map(path => writeFile(path,"",{mode:0o600,flag:"wx"})));
+    await execute(process.execPath,[
+      npm,"ci","--omit=dev","--ignore-scripts","--no-audit","--no-fund",
+      "--registry=https://registry.npmjs.org",`--userconfig=${userconfig}`,`--globalconfig=${globalconfig}`,
+      `--cache=${join(configHome,"cache")}`,"--fetch-retries=1","--fetch-timeout=15000",
+    ],{ cwd:releasePath, env:gitEnv(null), timeout:120_000, windowsHide:true, maxBuffer:256*1024 });
+  } finally {
+    await rm(configHome,{recursive:true,force:true});
+  }
+}
+
+async function prepareRuntime(releasePath, installRuntime) {
+  const present = async path => access(join(releasePath,path)).then(() => true, error => {
+    if (error.code==="ENOENT") return false;
+    throw error;
+  });
+  const [api,gateway,build] = await Promise.all(["server/api.mjs","frontend/gateway/index.mjs","frontend/build.mjs"].map(present));
+  // Old releases may have a frontend build but neither modern entrypoint.
+  if (!api && !gateway) return false;
+  if (!api || !gateway || !build) throw new Error("Incomplete AgentChat split release");
+  if (await present(".npmrc")) throw new Error("Split release cannot override npm configuration");
+  await installRuntime(releasePath);
+  await execute(process.execPath,[join(releasePath,"frontend","build.mjs")],{
+    cwd:releasePath, env:gitEnv(null), windowsHide:true, timeout:15_000, maxBuffer:64*1024,
+  });
+  return true;
+}
+
+async function launch(config, releasePath, dataDir, port, token, modern, disposable = false) {
+  await reserveLoopback(port);
+  const origin = `http://${loopback}:${port}`;
+  const backendPort = modern ? await reserveLoopback() : port;
+  if (modern && backendPort === port) throw new Error("Could not reserve a distinct backend port");
+  const backend = `http://${loopback}:${backendPort}`;
+  const services = [];
+  try {
+    services.push(startChild(releasePath,modern?"server/api.mjs":"server/index.mjs",serviceEnv(config,dataDir,backendPort,token)));
+    if (modern) {
+      services.push(startChild(releasePath,"frontend/gateway/index.mjs",{
+        ...gitEnv(null), AGENTCHAT_FRONTEND_HOST:loopback, AGENTCHAT_FRONTEND_PORT:String(port), AGENTCHAT_BACKEND_ORIGIN:backend,
+      }));
+      await waitForServices(services,() => probeLive(origin,backend,disposable ? token : null));
+      if (disposable) await probeDisposableChat(origin,token);
+    } else {
+      await waitForServices(services,async () => {
+        const response=await localFetch(origin,"/healthz");
+        await response.body?.cancel();
+        return response.ok;
+      });
     }
-    throw new Error("Service did not become healthy");
+    return services;
   } catch (error) {
-    if (!spawnError) await stopChild(child);
+    await stopServices(services);
     throw error;
   }
 }
 
 // Keep real process and file custody in this controller; allow local tests to
 // stand in for GitHub, Git command transport, and the four-minute poll wait.
-export async function supervise(config, signal, { fetcher = fetch, runGit = git, pause = delay, logger = console } = {}) {
+export async function supervise(config, signal, { fetcher = fetch, runGit = git, pause = delay, logger = console, installRuntime = installPinnedRuntime } = {}) {
   const { root } = config;
   await mkdir(root, { recursive: true, mode: 0o700 });
   const lock = join(root, "supervisor.lock");
@@ -226,18 +345,27 @@ export async function supervise(config, signal, { fetcher = fetch, runGit = git,
   const data = join(root, "data");
   const backups = join(root, "backups");
   const statePath = join(root, "active.json");
-  let child;
+  let services;
   let state;
-  const start = async release => { child = await launch(config, await prepareRelease(config, release, releases, runGit), data, config.port, config.token); };
-  const stop = async () => { await stopChild(child); child = null; };
+  const prepared = new Map();
+  async function ready(release) {
+    const path=await prepareRelease(config,release,releases,runGit);
+    if (!prepared.has(path)) prepared.set(path,await prepareRuntime(path,installRuntime));
+    return { path, modern:prepared.get(path) };
+  }
+  const start = async release => {
+    const {path,modern}=await ready(release);
+    services=await launch(config,path,data,config.port,config.token,modern);
+  };
+  const stop = async () => { await stopServices(services); services=null; };
   const smoke = async release => {
-    const releasePath = await prepareRelease(config, release, releases, runGit);
+    const {path,modern}=await ready(release);
     const smokeDir = await mkdtemp(join(tmpdir(), "agent-workspace-smoke-"));
     let trial;
     try {
-      trial = await launch({ ...config, publicOrigin: null, secureCookies: false }, releasePath, smokeDir, await reserveLoopback(), randomBytes(32).toString("hex"));
+      trial = await launch({ ...config, publicOrigin: null, secureCookies: false }, path, smokeDir, await reserveLoopback(), randomBytes(32).toString("hex"),modern,true);
     } finally {
-      await stopChild(trial);
+      await stopServices(trial);
       await rm(smokeDir, { recursive: true, force: true });
     }
   };
@@ -265,9 +393,9 @@ export async function supervise(config, signal, { fetcher = fetch, runGit = git,
           state = await transition(state, candidate, { start, stop, smoke, backup, persist });
           logger.log(`Activated ${candidate.sha} from GitHub CI run ${candidate.runId}`);
         }
-        if (state.active && (!child || childExited(child))) throw new Error("Active service exited; supervisor stopped for operator inspection");
+        if (state.active && !healthy(services)) throw new Error("Active service exited; supervisor stopped for operator inspection");
       } catch (error) {
-        if (state.active && (!child || childExited(child))) throw error;
+        if (state.active && !healthy(services)) throw error;
         logger.error("No release switch. Check verified main CI, Git access, and local readiness.");
       }
       await pause(240_000, null, { signal }).catch(error => { if (error.name !== "AbortError") throw error; });
